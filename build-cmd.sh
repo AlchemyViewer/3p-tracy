@@ -33,9 +33,8 @@ srcenv_file="$tmp_dir/ab_srcenv.sh"
 "$autobuild" source_environment > "$srcenv_file"
 . "$srcenv_file"
 
-build_id=${AUTOBUILD_BUILD_ID:=0}
 tracy_version="$(sed -n -E 's/(v[0-9]+\.[0-9]+\.[0-9]+) \(.+\)/\1/p' tracy/NEWS | head -1)"
-echo "${tracy_version}.${build_id}" > "${stage_dir}/VERSION.txt"
+echo "${tracy_version}" > "${stage_dir}/VERSION.txt"
 
 source_dir="tracy"
 pushd "$source_dir"
@@ -43,22 +42,50 @@ pushd "$source_dir"
         windows*)
             load_vsvars
 
-            cmake . -G "$AUTOBUILD_WIN_CMAKE_GEN" -DCMAKE_C_FLAGS="$LL_BUILD_RELEASE"
-            build_sln "tracy.sln" "Release|$AUTOBUILD_WIN_VSPLATFORM" "tracy"
-
-            mkdir -p "$stage_dir/lib/release"
-            mv Release/tracy.lib "$stage_dir/lib/release"
-
+            # First build the client lib
+            mkdir -p "$stage_dir/tools/tracy"
             mkdir -p "$stage_dir/include/tracy"
-            cp *.hpp "$stage_dir/include/tracy/"
+            mkdir -p "$stage_dir/lib/debug"
+            mkdir -p "$stage_dir/lib/release"
 
-            mkdir -p "$stage_dir/include/tracy/common"
-            cp common/*.hpp "$stage_dir/include/tracy/common"
-            cp common/*.h "$stage_dir/include/tracy/common"
+            mkdir -p "build_debug"
+            pushd "build_debug"
+                cmake .. -G "$AUTOBUILD_WIN_CMAKE_GEN" -A "$AUTOBUILD_WIN_VSPLATFORM" .. \
+                        -DCMAKE_INSTALL_PREFIX="$(cygpath -m $stage_dir)/debug" \
+                        -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
 
-            mkdir -p "$stage_dir/include/tracy/client"
-            cp client/*.hpp "$stage_dir/include/tracy/client"
-            cp client/*.h "$stage_dir/include/tracy/client"
+                cmake --build . --config Debug --clean-first
+                cmake --install . --config Debug
+            popd
+
+            mkdir -p "build_release"
+            pushd "build_release"
+                cmake .. -G "$AUTOBUILD_WIN_CMAKE_GEN" -A "$AUTOBUILD_WIN_VSPLATFORM" .. \
+                        -DCMAKE_INSTALL_PREFIX="$(cygpath -m $stage_dir)/release" \
+                        -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
+
+                cmake --build . --config Release --clean-first
+                cmake --install . --config Release
+            popd
+
+            cp -a $stage_dir/debug/lib/*.lib $stage_dir/lib/debug/
+            cp -a $stage_dir/release/lib/*.lib $stage_dir/lib/release/
+
+            cp -a $stage_dir/release/include/* $stage_dir/include/tracy
+
+            cmd.exe /c $(cygpath -w "vcpkg/install_vcpkg_dependencies.bat")
+
+            build_sln "capture/build/win32/capture.sln" "Release|x64"
+            build_sln "csvexport/build/win32/csvexport.sln" "Release|x64"
+            build_sln "import-chrome/build/win32/import-chrome.sln" "Release|x64"
+            build_sln "profiler/build/win32/Tracy.sln" "Release|x64"
+            build_sln "update/build/win32/update.sln" "Release|x64"
+
+            cp -a capture/build/win32/x64/Release/capture.exe $stage_dir/tools/tracy/
+            cp -a csvexport/build/win32/x64/Release/csvexport.exe $stage_dir/tools/tracy/
+            cp -a import-chrome/build/win32/x64/Release/import-chrome.exe $stage_dir/tools/tracy/
+            cp -a profiler/build/win32/x64/Release/Tracy.exe $stage_dir/tools/tracy/
+            cp -a update/build/win32/x64/Release/update.exe $stage_dir/tools/tracy/
         ;;
 
         darwin*)

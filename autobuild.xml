@@ -23,7 +23,7 @@
           <string>stage</string>
           <key>configurations</key>
           <map>
-            <key>RelWithDebInfo</key>
+            <key>Release</key>
             <map>
               <key>build</key>
               <map>
@@ -35,101 +35,59 @@
                 <key>command</key>
                 <string>bash</string>
               </map>
-              <key>default</key>
-              <string>True</string>
               <key>name</key>
-              <string>RelWithDebInfo</string>
-            </map>
-            <key>default</key>
-            <map>
-              <key>build</key>
-              <map>
-                <key>arguments</key>
-                <array>
-                  <string>-c</string>
-                  <string>../build-cmd.sh</string>
-                </array>
-                <key>command</key>
-                <string>bash</string>
-              </map>
-              <key>default</key>
-              <boolean>true</boolean>
-              <key>name</key>
-              <string>default</string>
+              <string>Release</string>
             </map>
           </map>
           <key>manifest</key>
           <array>
-            <string>include/tracy/*.hpp</string>
-            <string>include/tracy/common/*.hpp</string>
-            <string>include/tracy/common/*.h</string>
-            <string>include/tracy/client/*.hpp</string>
-            <string>include/tracy/client/*.h</string>
+            <string>include/tracy/*</string>
+            <string>tools/tracy/*</string>
           </array>
           <key>name</key>
           <string>common</string>
         </map>
         <key>linux</key>
         <map>
-          <key>build_directory</key>
-          <string>stage</string>
           <key>configurations</key>
           <map>
-            <key>default</key>
+            <key>Release</key>
             <map>
+              <key>build</key>
+              <map>
+              </map>
               <key>default</key>
               <boolean>true</boolean>
               <key>name</key>
-              <string>default</string>
+              <string>Release</string>
             </map>
           </map>
+          <key>manifest</key>
+          <array>
+            <string>lib/release/*</string>
+          </array>
           <key>name</key>
           <string>linux</string>
         </map>
         <key>windows</key>
         <map>
-          <key>build_directory</key>
-          <string>stage</string>
           <key>configurations</key>
           <map>
-            <key>RelWithDebInfo</key>
+            <key>Release</key>
             <map>
               <key>build</key>
               <map>
-                <key>arguments</key>
-                <array>
-                  <string>-c</string>
-                  <string>../build-cmd.sh</string>
-                </array>
-                <key>command</key>
-                <string>bash</string>
-              </map>
-              <key>default</key>
-              <string>True</string>
-              <key>name</key>
-              <string>RelWithDebInfo</string>
-            </map>
-            <key>default</key>
-            <map>
-              <key>build</key>
-              <map>
-                <key>arguments</key>
-                <array>
-                  <string>-c</string>
-                  <string>../build-cmd.sh</string>
-                </array>
-                <key>command</key>
-                <string>bash</string>
               </map>
               <key>default</key>
               <boolean>true</boolean>
               <key>name</key>
-              <string>default</string>
+              <string>Release</string>
             </map>
           </map>
           <key>manifest</key>
           <array>
-            <string>lib/release/tracy.lib</string>
+            <string>lib/release/*</string>
+            <string>tools/tracy/*</string>
           </array>
           <key>name</key>
           <string>windows</string>
