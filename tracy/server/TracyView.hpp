@@ -1,33 +1,41 @@
 #ifndef __TRACYVIEW_HPP__
 #define __TRACYVIEW_HPP__
 
+#include <array>
 #include <atomic>
 #include <functional>
-#include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "imgui.h"
+
 #include "TracyBadVersion.hpp"
 #include "TracyBuzzAnim.hpp"
 #include "TracyDecayValue.hpp"
 #include "TracyFileWrite.hpp"
-#include "TracyImGui.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySourceContents.hpp"
-#include "TracyTexture.hpp"
+#include "TracyTimelineController.hpp"
 #include "TracyUserData.hpp"
+#include "TracyUtility.hpp"
 #include "TracyVector.hpp"
 #include "TracyViewData.hpp"
 #include "TracyWorker.hpp"
 #include "tracy_robin_hood.h"
 
-struct ImVec2;
-struct ImFont;
-
 namespace tracy
 {
+
+constexpr const char* GpuContextNames[] = {
+    "Invalid",
+    "OpenGL",
+    "Vulkan",
+    "OpenCL",
+    "Direct3D 12",
+    "Direct3D 11"
+};
 
 struct MemoryPage;
 class FileRead;
@@ -73,15 +81,6 @@ class View
     };
 
 public:
-    struct VisData
-    {
-        bool visible = true;
-        bool showFull = true;
-        bool ghost = false;
-        int offset = 0;
-        int height = 0;
-    };
-
     struct PlotView
     {
         double min;
@@ -89,14 +88,15 @@ public:
     };
 
     using SetTitleCallback = void(*)( const char* );
-    using GetWindowCallback = void*(*)();
+    using SetScaleCallback = void(*)( float, ImFont*&, ImFont*&, ImFont*& );
+    using AttentionCallback = void(*)();
 
-    View( void(*cbMainThread)(std::function<void()>), ImFont* fixedWidth = nullptr, ImFont* smallFont = nullptr, ImFont* bigFont = nullptr, SetTitleCallback stcb = nullptr, GetWindowCallback gwcb = nullptr ) : View( cbMainThread, "127.0.0.1", 8086, fixedWidth, smallFont, bigFont, stcb, gwcb ) {}
-    View( void(*cbMainThread)(std::function<void()>), const char* addr, uint16_t port, ImFont* fixedWidth = nullptr, ImFont* smallFont = nullptr, ImFont* bigFont = nullptr, SetTitleCallback stcb = nullptr, GetWindowCallback gwcb = nullptr );
-    View( void(*cbMainThread)(std::function<void()>), FileRead& f, ImFont* fixedWidth = nullptr, ImFont* smallFont = nullptr, ImFont* bigFont = nullptr, SetTitleCallback stcb = nullptr, GetWindowCallback gwcb = nullptr );
+    View( void(*cbMainThread)(std::function<void()>, bool), const char* addr, uint16_t port, ImFont* fixedWidth, ImFont* smallFont, ImFont* bigFont, SetTitleCallback stcb, SetScaleCallback sscb, AttentionCallback acb );
+    View( void(*cbMainThread)(std::function<void()>, bool), FileRead& f, ImFont* fixedWidth, ImFont* smallFont, ImFont* bigFont, SetTitleCallback stcb, SetScaleCallback sscb, AttentionCallback acb );
     ~View();
 
-    static bool Draw();
+    bool Draw();
+    bool WasActive() const;
 
     void NotifyRootWindowSize( float w, float h ) { m_rootWidth = w; m_rootHeight = h; }
     void ViewSource( const char* fileName, int line );
@@ -109,21 +109,28 @@ public:
 
     const char* SourceSubstitution( const char* srcFile ) const;
 
-    void ShowSampleParents( uint64_t symAddr ) { m_sampleParents.symAddr = symAddr; m_sampleParents.sel = 0; }
+    void ShowSampleParents( uint64_t symAddr, bool withInlines ) { m_sampleParents.symAddr = symAddr; m_sampleParents.sel = 0; m_sampleParents.withInlines = withInlines; }
+
+    ViewData& GetViewData() { return m_vd; }
     const ViewData& GetViewData() const { return m_vd; }
 
+    ShortenName GetShortenName() const { return m_shortenName; }
+    int GetNextGpuIdx() { return m_gpuIdx++; }
+
+    void HighlightThread( uint64_t thread );
+    void ZoomToRange( int64_t start, int64_t end, bool pause = true );
+    bool DrawPlot( PlotData& plot, double pxns, int& offset, const ImVec2& wpos, bool hover, float yMin, float yMax );
+    bool DrawThread( const ThreadData& thread, double pxns, int& offset, const ImVec2& wpos, bool hover, float yMin, float yMax, bool ghostMode );
+    void DrawThreadMessages( const ThreadData& thread, double pxns, int offset, const ImVec2& wpos, bool hover );
+    void DrawThreadOverlays( const ThreadData& thread, const ImVec2& ul, const ImVec2& dr );
+    bool DrawGpu( const GpuCtxData& gpu, double pxns, int& offset, const ImVec2& wpos, bool hover, float yMin, float yMax );
+    bool DrawCpuData( double pxns, int& offset, const ImVec2& wpos, bool hover, float yMin, float yMax );
 
     bool m_showRanges = false;
     Range m_statRange;
+    Range m_waitStackRange;
 
 private:
-    enum class Namespace : uint8_t
-    {
-        Full,
-        Mid,
-        Short
-    };
-
     enum class ShortcutAction : uint8_t
     {
         None,
@@ -132,7 +139,7 @@ private:
 
     enum { InvalidId = 0xFFFFFFFF };
 
-    struct PathData
+    struct MemPathData
     {
         uint32_t cnt;
         uint64_t mem;
@@ -145,6 +152,32 @@ private:
         LastRange
     };
 
+    enum class MemRange
+    {
+        Full,
+        Active,
+        Inactive
+    };
+
+    struct KeyboardNavigation
+    {
+        enum Direction
+        {
+            // Pan left / right
+            Left,
+            Right,
+            // Zoom in / out
+            In,
+            Out
+        };
+
+        constexpr static auto DirectionToKeyMap = std::array<ImGuiKey, 4> { ImGuiKey_A, ImGuiKey_D, ImGuiKey_W, ImGuiKey_S };
+        constexpr static auto StartRangeMod = std::array<int, 4> { -1, 1, 1, -1 };
+        constexpr static auto EndRangeMod = std::array<int, 4> { -1, 1, -1, 1 };
+
+        std::array<float, 4> m_scrollInertia;
+    };
+
     struct ZoneColorData
     {
         uint32_t color;
@@ -153,21 +186,24 @@ private:
         bool highlight;
     };
 
+    struct SymList
+    {
+        uint64_t symAddr;
+        uint32_t incl, excl;
+        uint32_t count;
+    };
+
     void InitMemory();
     void InitTextEditor( ImFont* font );
-
-    const char* ShortenNamespace( const char* name ) const;
-
-    void DrawHelpMarker( const char* desc ) const;
 
     bool DrawImpl();
     void DrawNotificationArea();
     bool DrawConnection();
     void DrawFrames();
-    void DrawZoneFramesHeader();
-    void DrawZoneFrames( const FrameData& frames );
-    void DrawZones();
-    void DrawContextSwitches( const ContextSwitch* ctx, bool hover, double pxns, int64_t nspx, const ImVec2& wpos, int offset, int endOffset );
+    void DrawTimelineFramesHeader();
+    void DrawTimelineFrames( const FrameData& frames );
+    void DrawTimeline();
+    void DrawContextSwitches( const ContextSwitch* ctx, const Vector<SampleData>& sampleData, bool hover, double pxns, int64_t nspx, const ImVec2& wpos, int offset, int endOffset, bool isFiber );
     void DrawSamples( const Vector<SampleData>& vec, bool hover, double pxns, int64_t nspx, const ImVec2& wpos, int offset );
 #ifndef TRACY_NO_STATISTICS
     int DispatchGhostLevel( const Vector<GhostZone>& vec, bool hover, double pxns, int64_t nspx, const ImVec2& wpos, int offset, int depth, float yMin, float yMax, uint64_t tid );
@@ -186,20 +222,20 @@ private:
     int SkipGpuZoneLevel( const V& vec, bool hover, double pxns, int64_t nspx, const ImVec2& wpos, int offset, int depth, uint64_t thread, float yMin, float yMax, int64_t begin, int drift );
     void DrawLockHeader( uint32_t id, const LockMap& lockmap, const SourceLocation& srcloc, bool hover, ImDrawList* draw, const ImVec2& wpos, float w, float ty, float offset, uint8_t tid );
     int DrawLocks( uint64_t tid, bool hover, double pxns, const ImVec2& wpos, int offset, LockHighlight& highlight, float yMin, float yMax );
-    int DrawPlots( int offset, double pxns, const ImVec2& wpos, bool hover, float yMin, float yMax );
     void DrawPlotPoint( const ImVec2& wpos, float x, float y, int offset, uint32_t color, bool hover, bool hasPrev, const PlotItem* item, double prev, bool merged, PlotType type, PlotValueFormatting format, float PlotHeight, uint64_t name );
     void DrawPlotPoint( const ImVec2& wpos, float x, float y, int offset, uint32_t color, bool hover, bool hasPrev, double val, double prev, bool merged, PlotValueFormatting format, float PlotHeight );
-    int DrawCpuData( int offset, double pxns, const ImVec2& wpos, bool hover, float yMin, float yMax );
     void DrawOptions();
     void DrawMessages();
     void DrawMessageLine( const MessageData& msg, bool hasCallstack, int& idx );
     void DrawFindZone();
     void AccumulationModeComboBox();
     void DrawStatistics();
+    void DrawSamplesStatistics(Vector<SymList>& data, int64_t timeRange, AccumulationMode accumulationMode);
     void DrawMemory();
     void DrawAllocList();
     void DrawCompare();
     void DrawCallstackWindow();
+    void DrawCallstackTable( uint32_t callstack, bool globalEntriesButton );
     void DrawMemoryAllocWindow();
     void DrawInfo();
     void DrawTextEditor();
@@ -212,14 +248,23 @@ private:
     void DrawRanges();
     void DrawRangeEntry( Range& range, const char* label, uint32_t color, const char* popupLabel, int id );
     void DrawSourceTooltip( const char* filename, uint32_t line, int before = 3, int after = 3, bool separateTooltip = true );
+    void DrawWaitStacks();
 
     void ListMemData( std::vector<const MemEvent*>& vec, std::function<void(const MemEvent*)> DrawAddress, const char* id = nullptr, int64_t startTime = -1, uint64_t pool = 0 );
 
-    unordered_flat_map<uint32_t, PathData> GetCallstackPaths( const MemData& mem, bool onlyActive ) const;
-    unordered_flat_map<uint64_t, CallstackFrameTree> GetCallstackFrameTreeBottomUp( const MemData& mem ) const;
-    unordered_flat_map<uint64_t, CallstackFrameTree> GetCallstackFrameTreeTopDown( const MemData& mem ) const;
-    void DrawFrameTreeLevel( const unordered_flat_map<uint64_t, CallstackFrameTree>& tree, int& idx );
+    unordered_flat_map<uint32_t, MemPathData> GetCallstackPaths( const MemData& mem, MemRange memRange ) const;
+    unordered_flat_map<uint64_t, MemCallstackFrameTree> GetCallstackFrameTreeBottomUp( const MemData& mem ) const;
+    unordered_flat_map<uint64_t, MemCallstackFrameTree> GetCallstackFrameTreeTopDown( const MemData& mem ) const;
+    void DrawFrameTreeLevel( const unordered_flat_map<uint64_t, MemCallstackFrameTree>& tree, int& idx );
     void DrawZoneList( int id, const Vector<short_ptr<ZoneEvent>>& zones );
+
+    unordered_flat_map<uint64_t, CallstackFrameTree> GetCallstackFrameTreeBottomUp( const unordered_flat_map<uint32_t, uint64_t>& stacks, bool group ) const;
+    unordered_flat_map<uint64_t, CallstackFrameTree> GetCallstackFrameTreeTopDown( const unordered_flat_map<uint32_t, uint64_t>& stacks, bool group ) const;
+    void DrawFrameTreeLevel( const unordered_flat_map<uint64_t, CallstackFrameTree>& tree, int& idx );
+
+    unordered_flat_map<uint64_t, CallstackFrameTree> GetParentsCallstackFrameTreeBottomUp( const unordered_flat_map<uint32_t, uint32_t>& stacks, bool group ) const;
+    unordered_flat_map<uint64_t, CallstackFrameTree> GetParentsCallstackFrameTreeTopDown( const unordered_flat_map<uint32_t, uint32_t>& stacks, bool group ) const;
+    void DrawParentsFrameTreeLevel( const unordered_flat_map<uint64_t, CallstackFrameTree>& tree, int& idx );
 
     void DrawInfoWindow();
     void DrawZoneInfoWindow();
@@ -231,7 +276,10 @@ private:
     void DrawGpuInfoChildren( const V& children, int64_t ztime );
 
     void HandleRange( Range& range, int64_t timespan, const ImVec2& wpos, float w );
-    void HandleZoneViewMouse( int64_t timespan, const ImVec2& wpos, float w, double& pxns );
+    void HandleTimelineMouse( int64_t timespan, const ImVec2& wpos, float w, double& pxns );
+    void HandleTimelineKeyboard( int64_t timespan, const ImVec2& wpos, float w );
+
+    void AddAnnotation( int64_t start, int64_t end );
 
     uint32_t GetThreadColor( uint64_t thread, int depth );
     uint32_t GetSrcLocColor( const SourceLocation& srcloc, int depth );
@@ -243,7 +291,6 @@ private:
 
     void ZoomToZone( const ZoneEvent& ev );
     void ZoomToZone( const GpuEvent& ev );
-    void ZoomToRange( int64_t start, int64_t end, bool pause = true );
     void ZoomToPrevFrame();
     void ZoomToNextFrame();
     void CenterAtTime( int64_t t );
@@ -254,10 +301,12 @@ private:
     void ZoneTooltip( const ZoneEvent& ev );
     void ZoneTooltip( const GpuEvent& ev );
     void CallstackTooltip( uint32_t idx );
+    void CallstackTooltipContents( uint32_t idx );
     void CrashTooltip();
 
     const ZoneEvent* GetZoneParent( const ZoneEvent& zone ) const;
     const ZoneEvent* GetZoneParent( const ZoneEvent& zone, uint64_t tid ) const;
+    const ZoneEvent* GetZoneChild( const ZoneEvent& zone, int64_t time ) const;
     bool IsZoneReentry( const ZoneEvent& zone ) const;
     bool IsZoneReentry( const ZoneEvent& zone, uint64_t tid ) const;
     const GpuEvent* GetZoneParent( const GpuEvent& zone ) const;
@@ -269,6 +318,8 @@ private:
     const ZoneEvent* FindZoneAtTime( uint64_t thread, int64_t time ) const;
     uint64_t GetFrameNumber( const FrameData& fd, int i, uint64_t offset ) const;
     const char* GetFrameText( const FrameData& fd, int i, uint64_t ftime, uint64_t offset ) const;
+    const char* GetFrameSetName( const FrameData& fd ) const;
+    static const char* GetFrameSetName( const FrameData& fd, const Worker& worker );
 
 #ifndef TRACY_NO_STATISTICS
     void FindZones();
@@ -276,7 +327,6 @@ private:
 #endif
 
     std::vector<MemoryPage> GetMemoryPages() const;
-    const char* GetPlotName( const PlotData* plot ) const;
 
     void SmallCallstackButton( const char* name, uint32_t callstack, int& idx, bool tooltip = true );
     void DrawCallstackCalls( uint32_t callstack, uint16_t limit ) const;
@@ -300,22 +350,14 @@ private:
     void SetPlaybackFrame( uint32_t idx );
     bool Save( const char* fn, FileWrite::Compression comp, int zlevel, bool buildDict );
 
-    unordered_flat_map<const void*, VisData> m_visData;
+    void Attention( bool& alreadyDone );
+
     unordered_flat_map<uint64_t, bool> m_visibleMsgThread;
+    unordered_flat_map<uint64_t, bool> m_waitStackThread;
     unordered_flat_map<const void*, int> m_gpuDrift;
     unordered_flat_map<const PlotData*, PlotView> m_plotView;
     Vector<const ThreadData*> m_threadOrder;
     Vector<float> m_threadDnd;
-
-    tracy_force_inline VisData& Vis( const void* ptr )
-    {
-        auto it = m_visData.find( ptr );
-        if( it == m_visData.end() )
-        {
-            it = m_visData.emplace( ptr, VisData {} ).first;
-        }
-        return it->second;
-    }
 
     tracy_force_inline bool& VisibleMsgThread( uint64_t thread )
     {
@@ -323,6 +365,16 @@ private:
         if( it == m_visibleMsgThread.end() )
         {
             it = m_visibleMsgThread.emplace( thread, true ).first;
+        }
+        return it->second;
+    }
+
+    tracy_force_inline bool& WaitStackThread( uint64_t thread )
+    {
+        auto it = m_waitStackThread.find( thread );
+        if( it == m_waitStackThread.end() )
+        {
+            it = m_waitStackThread.emplace( thread, true ).first;
         }
         return it->second;
     }
@@ -337,7 +389,19 @@ private:
         return it->second;
     }
 
-    void AdjustThreadHeight( View::VisData& vis, int oldOffset, int& offset );
+    static int64_t AdjustGpuTime( int64_t time, int64_t begin, int drift );
+
+    static const char* DecodeContextSwitchState( uint8_t state );
+    static const char* DecodeContextSwitchStateCode( uint8_t state );
+    static const char* DecodeContextSwitchReason( uint8_t reason );
+    static const char* DecodeContextSwitchReasonCode( uint8_t reason );
+
+    tracy_force_inline bool& Vis( const void* ptr )
+    {
+        auto it = m_visMap.find( ptr );
+        if( it == m_visMap.end() ) it = m_visMap.emplace( ptr, true ).first;
+        return it->second;
+    }
 
     Worker m_worker;
     std::string m_filename, m_filenameStaging;
@@ -348,11 +412,14 @@ private:
     uint64_t m_totalMemory;
 
     ViewData m_vd;
+    TimelineController m_tc;
+    KeyboardNavigation m_kbNavCtrl;
 
     const ZoneEvent* m_zoneInfoWindow = nullptr;
     const ZoneEvent* m_zoneHighlight;
     DecayValue<int16_t> m_zoneSrcLocHighlight = 0;
     LockHighlight m_lockHighlight { -1 };
+    LockHighlight m_nextLockHighlight;
     DecayValue<const MessageData*> m_msgHighlight = nullptr;
     DecayValue<uint32_t> m_lockHoverHighlight = InvalidId;
     DecayValue<const MessageData*> m_msgToFocus = nullptr;
@@ -375,6 +442,7 @@ private:
     bool m_showMessageImages = false;
     int m_visibleMessages = 0;
     size_t m_prevMessages = 0;
+    bool m_messagesShowCallstack = false;
     Vector<uint32_t> m_msgList;
     bool m_disconnectIssued = false;
     DecayValue<uint64_t> m_drawThreadMigrations = 0;
@@ -401,6 +469,7 @@ private:
     bool m_showPlayback = false;
     bool m_showCpuDataWindow = false;
     bool m_showAnnotationList = false;
+    bool m_showWaitStacks = false;
 
     AccumulationMode m_statAccumulationMode = AccumulationMode::SelfOnly;
     bool m_statSampleTime = true;
@@ -417,10 +486,15 @@ private:
     bool m_allocTimeRelativeToZone = true;
     bool m_ctxSwitchTimeRelativeToZone = true;
     bool m_messageTimeRelativeToZone = true;
+    bool m_messagesExcludeChildren = true;
     uint64_t m_zoneInfoMemPool = 0;
+    int m_waitStack = 0;
+    int m_waitStackMode = 0;
+    bool m_groupWaitStackBottomUp = true;
+    bool m_groupWaitStackTopDown = true;
 
     ShortcutAction m_shortcut = ShortcutAction::None;
-    Namespace m_namespace = Namespace::Short;
+    ShortenName m_shortenName = ShortenName::NoSpaceAndNormalize;
     Animation m_zoomAnim;
     BuzzAnim<int> m_callstackBuzzAnim;
     BuzzAnim<int> m_sampleParentBuzzAnim;
@@ -446,15 +520,16 @@ private:
     float m_rootWidth, m_rootHeight;
     SetTitleCallback m_stcb;
     bool m_titleSet = false;
-    GetWindowCallback m_gwcb;
+    SetScaleCallback m_sscb;
+    AttentionCallback m_acb;
 
     float m_notificationTime = 0;
     std::string m_notificationText;
 
     bool m_groupCallstackTreeByNameBottomUp = true;
     bool m_groupCallstackTreeByNameTopDown = true;
-    bool m_activeOnlyBottomUp = false;
-    bool m_activeOnlyTopDown = false;
+    MemRange m_memRangeBottomUp = MemRange::Full;
+    MemRange m_memRangeTopDown = MemRange::Full;
 
     enum class SaveThreadState
     {
@@ -484,8 +559,10 @@ private:
     std::vector<std::unique_ptr<Annotation>> m_annotations;
     UserData m_userData;
 
+    bool m_wasActive = false;
     bool m_reconnectRequested = false;
-    int m_firstFrame = 10;
+    bool m_firstFrame = true;
+    std::chrono::time_point<std::chrono::high_resolution_clock> m_firstFrameTime;
     float m_yDelta;
 
     std::vector<SourceRegex> m_sourceSubstitutions;
@@ -495,8 +572,13 @@ private:
     bool m_setRangePopupOpen = false;
 
     unordered_flat_map<int16_t, StatisticsCache> m_statCache;
+    unordered_flat_map<int16_t, StatisticsCache> m_gpuStatCache;
 
-    void(*m_cbMainThread)(std::function<void()>);
+    unordered_flat_map<const void*, bool> m_visMap;
+
+    void(*m_cbMainThread)(std::function<void()>, bool);
+
+    int m_gpuIdx = 0;
 
     struct FindZone {
         enum : uint64_t { Unselected = std::numeric_limits<uint64_t>::max() - 1 };
@@ -507,6 +589,7 @@ private:
         {
             uint16_t id;
             Vector<short_ptr<ZoneEvent>> zones;
+            Vector<uint16_t> zonesTids;
             int64_t time = 0;
         };
 
@@ -553,6 +636,12 @@ private:
             ptrdiff_t distEnd;
         } binCache;
 
+        struct {
+            Vector<SymList> counts;
+            bool scheduleUpdate = false;
+            bool enabled = false;
+        } samples;
+
         void Reset()
         {
             ResetMatch();
@@ -560,6 +649,7 @@ private:
             selMatch = 0;
             selGroup = Unselected;
             highlight.active = false;
+            samples.counts.clear();
         }
 
         void ResetMatch()
@@ -594,6 +684,7 @@ private:
             selTotal = 0;
             selTime = 0;
             binCache.numBins = -1;
+            samples.scheduleUpdate = true;
         }
 
         void ShowZone( int16_t srcloc, const char* name )
@@ -679,9 +770,9 @@ private:
         char pattern[1024] = {};
         uint64_t ptrFind = 0;
         uint64_t pool = 0;
-        bool restrictTime = false;
         bool showAllocList = false;
         std::vector<size_t> allocList;
+        Range range;
     } m_memInfo;
 
     struct {
@@ -730,9 +821,27 @@ private:
     struct {
         uint64_t symAddr = 0;
         int sel;
+        bool withInlines = false;
+        int mode = 0;
+        bool groupBottomUp = true;
+        bool groupTopDown = true;
     } m_sampleParents;
 
+    struct
+    {
+        bool enabled = false;
+        bool monitor = false;
+        int64_t time;
+    } m_sendQueueWarning;
+
     std::vector<std::pair<int, int>> m_cpuUsageBuf;
+
+    bool m_attnProtoMismatch = false;
+    bool m_attnNotAvailable = false;
+    bool m_attnDropped = false;
+    bool m_attnFailure = false;
+    bool m_attnWorking = false;
+    bool m_attnDisconnected = false;
 };
 
 }

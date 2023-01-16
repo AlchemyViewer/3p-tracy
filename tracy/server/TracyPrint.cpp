@@ -117,7 +117,15 @@ static inline void PrintSmallIntFrac( char*& buf, uint64_t v )
     uint64_t fr = v % 1000;
     if( fr >= 995 )
     {
-        PrintSmallInt( buf, in+1 );
+        if( in < 999 )
+        {
+            PrintSmallInt( buf, in+1 );
+        }
+        else
+        {
+            memcpy( buf, "1000", 4 );
+            buf += 4;
+        }
     }
     else
     {
@@ -257,9 +265,16 @@ const char* TimeToStringExact( int64_t _ns )
         const auto h = int64_t( ns / ( 1000ll * 1000 * 1000 * 60 * 60 ) - d * 24 );
         const auto m = int64_t( ns / ( 1000ll * 1000 * 1000 * 60 ) - d * ( 60 * 24 ) - h * 60 );
         const auto s = int64_t( ns / ( 1000ll * 1000 * 1000 ) - d * ( 60 * 60 * 24 ) - h * ( 60 * 60 ) - m * 60 );
-        assert( d < 100 );
-        PrintTinyInt( buf, d );
-        *buf++ = 'd';
+        if( d < 100 )
+        {
+            PrintTinyInt( buf, d );
+            *buf++ = 'd';
+        }
+        else
+        {
+            memcpy( buf, "100+d", 5 );
+            buf += 5;
+        }
         PrintTinyInt0( buf, h );
         *buf++ = ':';
         PrintTinyInt0( buf, m );

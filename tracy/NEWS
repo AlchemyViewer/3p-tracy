@@ -2,16 +2,182 @@ Note: There is no guarantee that version mismatched client and server will
 be able to talk with each other. Network protocol breakages won't be listed
 here.
 
-
-v0.x.x (xxxx-xx-xx)
+v0.9.0 (2022-10-26)
 -------------------
 
-- Cygwin and Mingw are deprecated due to lack of interest.
+- Attention! All the header and source files used for integrating Tracy with
+  applications were moved to the public/ directory. This will break your
+  integration!
+  - To fix this, update the source and include directories lists to point to
+    the new location.
+  - Tracy include files directly referenced by the client were moved to
+    tracy/ subdirectory, to facilitate setups which previously had Tracy
+    checkout parent directory in the include paths list (i.e. when you
+    included "tracy/Tracy.hpp").
+  - Previously, if you have included the Tracy checkout directory in your
+    project include directories list (i.e. you could include "Tracy.hpp"),
+    this could result in third-party library conflicts, e.g. with ImGui.
+    Such scenarios are no longer the case.
+- Tracy macros now require to be terminated with a semicolon.
+- The undocumented ___tracy_demangle() function API has been changed. Please
+  refer to the source code for further instructions.
+- The parameter callback and its registration macro have been extended to
+  include user data pointer. You will need to update your code accordingly.
+- Plots visualization has been improved.
+  - Each plot now has its own color, which can also be defined by the user.
+  - The area below the plot is now optionally filled with a color.
+  - Plots can now also be configured to be staircase instead of smooth. This
+    new setting is appropriate for many inputs where only discrete values
+    make sense, e.g. the memory allocation plot.
+  - The API for TracyPlotConfig() macro has been changed. Please refer to
+    the manual to see how you can fix this.
+- Some text labels in the user interface are now more easy to read.
+- The profiler will now instruct the user in the UI on what can be done, if
+  the send queue is slow to process (typically due to symbol resolution).
+- If a client with an incompatible protocol is discovered, Tracy will now
+  try to show which versions can be used to handle the connection.
+- Messages list in zone info window can now show messages exclusive to the
+  zone, filtering out the messages emitted from child zones.
+- Added capture of vertical synchronization timings on Linux.
+- The range of frame bar colors in the frames overview on top of the screen
+  can be now controlled with the "Target FPS" entry box in the options menu.
+  - The "Draw frame targets" option does not need to be selected.
+  - Previously the hardcoded FPS target thresholds were: 30, 60, 144 FPS.
+  - Currently the FPS target threshold is: half of target, target, twice the
+    target.
+- Reworked the way zone names are shortened.
+  - Previously shortening supported only namespace removal, in a way that
+    didn't consider function parameters or template arguments.
+    - Shortening to one-letter namespace chains is no longer available.
+  - The new shortening rules first perform normalization of the function name.
+    - The function const qualifier is removed.
+    - Common return types are removed.
+    - All function parameters and all template arguments are removed.
+  - The next steps consist of repeated removal of namespaces, starting with
+    the most outermost one.
+    - While the old process was all or nothing, the new implementation by
+      default will dynamically adjust to the space available, trying to show
+      the most context possible.
+  - It is also possible to completely disable shortening, or require that it
+    is always performed in full.
+  - Function name normalization is enabled by default, even if there is space
+    to show full function name. This can be changed in options.
+  - Previously shortening was only applied to the zone names displayed on the
+    timeline. Currently this process will also apply to all other places in
+    the UI where function names are displayed. However, in these cases the
+    function names will only be normalized.
+    - Full function names are still available as tooltips, or in fine print if
+      the normalized name is already displayed in a tooltip.
+    - This functionality is disabled if zone name shortening is disabled.
+- Added context menu for timeline labels. Currently the only option is to hide
+  the selected thread, plot, etc.
+- You can now provide custom source file contents through a profiler callback.
+- Exposed Tracy version to client applications (available through the
+  common/TracyVersion.hpp header file).
+- D3D12 instrumentation is now thread-safe.
+- Timeline can be now navigated with WASD keys.
+- Symbol file paths are now normalized on libbacktrace systems. For example,
+  instead of "/usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/12.2.0/../../../../
+  include/c++/12.2.0/bits/std_mutex.h" Tracy will now report such file as
+  "/usr/include/c++/12.2.0/bits/std_mutex.h".
+- The import-chrome utility interprets Instant (`i`/`I`) events where the
+  `name` field contains the word `frame` as a frame event. The `name` is the
+  frame set name.
+- Frame data won't be displayed if there was no frame instrumentation in the
+  profiling session.
+  - Note that some automated functionality (e.g. vertical synchronization
+    capture) may automatically generate frame data, which will force frames to
+    be displayed.
+- Tracy threads will now be collapsed by default on the timeline.
+- Clicking on a local thread in the CPU data view will make the thread visible
+  and uncollapsed on the timeline.
+- Assembly view is now in color.
+- The profiler UI will no longer unnecessarily redraw the screen if nothing
+  was changed. This should have a profound impact on power usage.
+- Added microarchitecture data for Zen 4.
+- Implemented optional propagation of inline cost down the local call stack.
+  - This feature may be useful when trying to get a general outlook of the
+    cost at the top-level function in the symbol.
+  - It is possible to get nonsense data when this is enabled, for example
+    total cost exceeding 100%. This is by design.
+  - Assembly line costs are not affected.
+- Available clients now also broadcast their PID.
+- Reversed mouse button assignments for jumping to source / assembly line in
+  symbol view. The left mouse button will now focus the target line.
+- Assembly lines tooltip will now display local call stack of inline functions
+  (within the symbol).
+  - Right-clicking the source location entry in assembly line will show the
+    local call stack, along with source code preview of each entry and ability
+    to navigate to any selected inline function.
+- The profiler UI will now indicate that it needs attention if the window is
+  not focused and something interesting happens. For example when a connection
+  is established, or when a saved trace finishes loading, etc. How the
+  attention request is indicated depends on the operating system.
+- Clicking on the red microarchitecture icon in the symbol view assembly pane
+  will switch the selected microarchitecture to one the profiled application
+  was running on.
+- Removed option to display instruction latencies in a graphical form. Latency
+  data is still available in instruction tooltip.
+
+
+v0.8.2 (2022-06-28)
+-------------------
+
+- Added support for debuginfod debug information services. Note that
+  since this depends on proper system configuration, vendors providing
+  the debug information, and network retrieval, it is disabled by
+  default. To enable, compile the profiled application with the
+  TRACY_DEBUGINFOD define and link with libdebuginfod.
+- When Tracy server-side utilities are build with MSVC, the required
+  libraries will be now automatically retrieved and built with vcpkg.
+- Added microarchitecture data for: Bonnell, Airmont, Goldmont, Goldmont
+  Plus, Tremont.
+- Recognize additional CPUIDs of Zen 3, Alder Lake, Ice Lake
+  microarchitectures.
+- Assembly line width will be now extended, if needed. Previously the line
+  width was calculated for the initial layout and changing amount of
+  displayed data (especially listing the read/written registers) didn't
+  affect this, which may have made some lines partially unreadable.
+- Added ability to filter call stacks in memory tab by inactive allocations.
+  Filtering by inactive allocations helps to pinpoint wasteful allocations
+  in the program.
+- Plot graph will no longer display min/max values interpolated for
+  animation, but rather true values.
+- The CPU topology tree structure was replaced by a CPU schematic showing
+  the same thing in a more concise way.
+
+
+v0.8.1 (2022-04-21)
+-------------------
+
+- Support for pre-0.7 traces has been dropped.
+- Update utility can now scan for source files missing in the trace cache,
+  if the '-c' parameter is given. Found files will be added to the cache.
+- Added high-priority queue for fast queries to bypass slow symbol queries.
+- Fixed Android documentation to show how to enable context switch tracing.
+- Workaround MSVC 2015 stupidity which prevented compilation as C++11.
+- Added support for showing branch cost data for CPUs that don't report
+  branch retirement events (but do report branch misses).
+- The right-click context menu available for jump arrows in the symbol view
+  window will now additionally display jump context, i.e. jump sources and
+  jump target source code fragments.
+- Added freedesktop.org compliant desktop entry and MIME type definition.
+- The call stack column in list of messages will now be only displayed when
+  at least one message on the list has call stack data.
+- File dialogs on Unix will be now native to the desktop environment you are
+  using. Note that this relies on xdg-desktop-portal and dbus.
+
+
+v0.8.0 (2022-03-28)
+-------------------
+
+- Support for Cygwin has been dropped. It was not working for a very long
+  time and nobody had complained about it.
+- Mingw is deprecated due to lack of interest.
 - Added TRACY_NO_CALLSTACK_INLINES macro to disable inline functions
   resolution in call stacks on Windows.
-- Limited client query response rate.
 - Improved function matching algorithm in compare traces view.
-- Added minimal CMake integration layer.
+- Added CMake integration.
 - Reworked rpmalloc initialization.
 - Fixed display of messages with newlines on messages list.
 - Excluded some uninteresting wrapper functions from call stacks (for
@@ -27,6 +193,8 @@ v0.x.x (xxxx-xx-xx)
     originating function.
   - If symbol view is restricted to a single inline function, all assembly
     instructions not in this context will be dimmed out.
+  - Likewise, the navigation in assembly code will be limited just to the
+    inline context, if a single function is selected.
 - Kernel call stacks will be now properly captured and displayed in the
   profiler. Kernel functions are marked with the red color.
 - The CPU hardware performance counters can be now sampled on Linux.
@@ -39,6 +207,64 @@ v0.x.x (xxxx-xx-xx)
     stack sampling.
 - The image name filter entry field is now providing a list of available
   images.
+- Reentrant function calls may be now excluded from calculations in the
+  statistics view.
+- Crash handler is now properly removed during profiler destruction.
+- Repeatedly right-clicking on the same source line in the symbol view
+  window will now cycle through assembly blocks associated with this source
+  line.
+- Vulkan headers must be now explicitly included before including
+  TracyVulkan.hpp.
+- The capture utility may now limit capture time to a specified number of
+  seconds.
+- Fixed message thread assignment in the import-chrome utility.
+- Sampling data can be now also found in the find zone menu.
+- Instrumentation failures may now display their context, e.g. the zone text
+  that was to be set.
+- A warning is now displayed when sampling data is out-of-order.
+- Average value for plots can be now viewed.
+- Moved symbol resolution to a separate thread. Profiling will no longer be
+  stuck when there is a large number of symbols to resolve. This not only
+  improves user experience, but also prevents buildup of data (and memory
+  consumption) on the client side.
+- Android device name will be now reported.
+- Added support for capturing fibers.
+  - Fibers require additional processing, which has to be enabled by adding
+    the TRACY_FIBERS define on the client side.
+  - Client code requires additional instrumentation using the new macros
+    TracyFiberEnter and TracyFiberLeave (or the corresponding C API
+    variants).
+  - Fibers are represented in traces as separate threads, and are
+    distinguished by green color. Faux context switch regions are used to
+    indicate when a fiber is being run by the worker thread.
+- Continuous frame marks no longer need to be issued from a single thread.
+- Context switch call stacks are now captured on Windows and Linux.
+  - Hovering the context switch wait region will now display wait stack,
+    which may provide additional insight into why the switch happened.
+  - Wait stacks inspection can be performed in a new view.
+    - Stacks can be limited to certain threads and to a selected time range.
+    - Stacks are presented either as a sorted list, or as a bottom-up and
+      top-down trees.
+- Entry call stacks can be now also viewed as a bottom-up and top-down
+  trees.
+- Updated project build files to MSVC 2022.
+- Call stack tooltips now also show the executable image name.
+- Playback frames can be now changed by interacting with the frame image
+  slider using the mouse wheel.
+- Signal used to handle crashes on Linux can be now redefined.
+- Various DPI scaling improvements.
+- User interface can be now scaled in run time.
+- Symbol code retrieval now also supports kernel on Windows.
+- Added low-level C API interface for GPU zones.
+- Symbol child calls can be now listed.
+- Replaced "restrict time" in memory window with a proper time range limit.
+- Added Alder Lake microarchitectural data.
+- Added GPU zone statistics.
+- Universal Windows Platform support.
+- All call stack related functionality can be now disabled with the
+  TRACY_NO_CALLSTACK macro.
+- Added ability to add full-view annotations from the annotations list
+  window.
 
 
 v0.7.8 (2021-05-19)

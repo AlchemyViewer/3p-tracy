@@ -24,24 +24,19 @@
 #define ZDICT_STATIC_LINKING_ONLY
 #include "../zstd/zdict.h"
 
-#include "../common/TracyProtocol.hpp"
-#include "../common/TracySystem.hpp"
-#include "../common/TracyYield.hpp"
-#include "../common/TracyStackFrames.hpp"
+#include "../public/common/TracyProtocol.hpp"
+#include "../public/common/TracySystem.hpp"
+#include "../public/common/TracyYield.hpp"
+#include "../public/common/TracyStackFrames.hpp"
+#include "../public/common/TracyVersion.hpp"
 #include "TracyFileRead.hpp"
 #include "TracyFileWrite.hpp"
 #include "TracySort.hpp"
 #include "TracyTaskDispatch.hpp"
-#include "TracyVersion.hpp"
 #include "TracyWorker.hpp"
 
 namespace tracy
 {
-
-static tracy_force_inline uint64_t PackFileLine( uint32_t fileIdx, uint32_t line )
-{
-    return ( uint64_t( fileIdx ) << 32 ) | line;
-}
 
 static tracy_force_inline uint32_t UnpackFileLine( uint64_t packed, uint32_t& line )
 {
@@ -63,7 +58,7 @@ static bool SourceFileValid( const char* fn, uint64_t olderThan )
 static const uint8_t FileHeader[8] { 't', 'r', 'a', 'c', 'y', Version::Major, Version::Minor, Version::Patch };
 enum { FileHeaderMagic = 5 };
 static const int CurrentVersion = FileVersion( Version::Major, Version::Minor, Version::Patch );
-static const int MinSupportedVersion = FileVersion( 0, 6, 0 );
+static const int MinSupportedVersion = FileVersion( 0, 7, 0 );
 
 
 static void UpdateLockCountLockable( LockMap& lockmap, size_t pos )
@@ -238,7 +233,7 @@ static tracy_force_inline void UpdateLockRange( LockMap& lockmap, const LockEven
 }
 
 template<size_t U>
-static void ReadHwSampleVec( FileRead& f, SortedVector<Int48, Int48Sort>& vec, Slab<U>& slab )
+static uint64_t ReadHwSampleVec( FileRead& f, SortedVector<Int48, Int48Sort>& vec, Slab<U>& slab )
 {
     uint64_t sz;
     f.Read( sz );
@@ -251,6 +246,12 @@ static void ReadHwSampleVec( FileRead& f, SortedVector<Int48, Int48Sort>& vec, S
             vec[i] = ReadTimeOffset( f, refTime );
         }
     }
+    return sz;
+}
+
+static bool IsQueryPrio( ServerQuery type )
+{
+    return type < ServerQuery::ServerQueryDisconnect;
 }
 
 
@@ -263,13 +264,15 @@ Worker::Worker( const char* addr, uint16_t port )
     , m_stream( LZ4_createStreamDecode() )
     , m_buffer( new char[TargetFrameSize*3 + 1] )
     , m_bufferOffset( 0 )
+    , m_inconsistentSamples( false )
     , m_pendingStrings( 0 )
     , m_pendingThreads( 0 )
+    , m_pendingFibers( 0 )
     , m_pendingExternalNames( 0 )
     , m_pendingSourceLocation( 0 )
     , m_pendingCallstackFrames( 0 )
     , m_pendingCallstackSubframes( 0 )
-    , m_pendingCodeInformation( 0 )
+    , m_pendingSymbolCode( 0 )
     , m_callstackFrameStaging( nullptr )
     , m_traceVersion( CurrentVersion )
     , m_loadTime( 0 )
@@ -286,6 +289,7 @@ Worker::Worker( const char* addr, uint16_t port )
 
 #ifndef TRACY_NO_STATISTICS
     m_data.sourceLocationZonesReady = true;
+    m_data.gpuSourceLocationZonesReady = true;
     m_data.callstackSamplesReady = true;
     m_data.ghostZonesReady = true;
     m_data.ctxUsageReady = true;
@@ -308,6 +312,7 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
     , m_samplingPeriod( 0 )
     , m_stream( nullptr )
     , m_buffer( nullptr )
+    , m_inconsistentSamples( false )
     , m_traceVersion( CurrentVersion )
 {
     m_data.sourceLocationExpand.push_back( 0 );
@@ -339,13 +344,13 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
     {
         if( !v.isEnd )
         {
-            SourceLocation srcloc {
+            SourceLocation srcloc {{
                 StringRef(),
                 StringRef( StringRef::Idx, StoreString( v.name.c_str(), v.name.size() ).idx ),
                 StringRef( StringRef::Idx, StoreString( v.locFile.c_str(), v.locFile.size() ).idx ),
                 v.locLine,
                 0
-            };
+            }};
             int key;
             auto it = m_data.sourceLocationPayloadMap.find( &srcloc );
             if( it == m_data.sourceLocationPayloadMap.end() )
@@ -383,8 +388,12 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
                 extra.text = StringIdx( StoreString( v.text.c_str(), v.text.size() ).idx );
             }
 
-            m_threadCtxData = NoticeThread( v.tid );
-            NewZone( zone, v.tid );
+            if( m_threadCtx != v.tid )
+            {
+                m_threadCtx = v.tid;
+                m_threadCtxData = NoticeThread( v.tid );
+            }
+            NewZone( zone );
         }
         else
         {
@@ -408,15 +417,46 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
         }
     }
 
+    std::unordered_map<std::string, uint64_t> frameNames;
+
     for( auto& v : messages )
     {
-        auto msg = m_slab.Alloc<MessageData>();
-        msg->time = v.timestamp;
-        msg->ref = StringRef( StringRef::Type::Idx, StoreString( v.message.c_str(), v.message.size() ).idx );
-        msg->thread = CompressThread( v.tid );
-        msg->color = 0xFFFFFFFF;
-        msg->callstack.SetVal( 0 );
-        InsertMessageData( msg );
+        // There is no specific chrome-tracing type for frame events. We use messages that contain the word "frame"
+        std::string lower( v.message );
+        std::transform( lower.begin(), lower.end(), lower.begin(), []( char c ) { return char( std::tolower( c ) ); } );
+        if( lower.find( "frame" ) != std::string::npos )
+        {
+            // Reserve 0 as the default FrameSet, since it replaces the name with "Frame" and we want to keep our custom names.
+            auto result = frameNames.emplace( v.message, frameNames.size() + 1 );
+            auto fd = m_data.frames.Retrieve( result.first->second, [&] ( uint64_t name ) {
+                auto fd = m_slab.AllocInit<FrameData>();
+                fd->name = name;
+                fd->continuous = 1;
+                return fd;
+            }, [&] ( uint64_t name ) {
+                HandleFrameName( name, v.message.c_str(), v.message.length() );
+            });
+
+            int64_t time = v.timestamp;
+            fd->frames.push_back( FrameEvent{ time, -1, -1 } );
+            if ( m_data.lastTime < time ) m_data.lastTime = time;
+        }
+        else
+        {
+            auto msg = m_slab.Alloc<MessageData>();
+            msg->time = v.timestamp;
+            msg->ref = StringRef( StringRef::Type::Idx, StoreString( v.message.c_str(), v.message.size() ).idx );
+            msg->thread = CompressThread( v.tid );
+            msg->color = 0xFFFFFFFF;
+            msg->callstack.SetVal( 0 );
+
+            if( m_threadCtx != v.tid )
+            {
+                m_threadCtx = v.tid;
+                m_threadCtxData = nullptr;
+            }
+            InsertMessageData( msg );
+        }
     }
 
     for( auto& v : plots )
@@ -433,7 +473,11 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
         plot->name = nptr;
         plot->type = PlotType::User;
         plot->format = v.format;
+        plot->showSteps = false;
+        plot->fill = true;
+        plot->color = 0;
 
+        double sum = 0;
         double min = v.data.begin()->second;
         double max = v.data.begin()->second;
         plot->data.reserve_exact( v.data.size(), m_slab );
@@ -445,9 +489,11 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
             idx++;
             if( min > p.second ) min = p.second;
             else if( max < p.second ) max = p.second;
+            sum += p.second;
         }
         plot->min = min;
         plot->max = max;
+        plot->sum = sum;
 
         m_data.plots.Data().push_back( plot );
     }
@@ -485,29 +531,32 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
         }
     }
 
-    m_data.framesBase = m_data.frames.Retrieve( 0, [this] ( uint64_t name ) {
-        auto fd = m_slab.AllocInit<FrameData>();
-        fd->name = name;
-        fd->continuous = 1;
-        return fd;
-    }, [this] ( uint64_t name ) {
-        assert( name == 0 );
-        char tmp[6] = "Frame";
-        HandleFrameName( name, tmp, 5 );
-    } );
+    // Add a default frame if we didn't have any framesets
+    if( frameNames.empty() )
+    {
+        m_data.framesBase = m_data.frames.Retrieve( 0, [this] ( uint64_t name ) {
+            auto fd = m_slab.AllocInit<FrameData>();
+            fd->name = name;
+            fd->continuous = 1;
+            return fd;
+        }, [this] ( uint64_t name ) {
+            assert( name == 0 );
+            char tmp[6] = "Frame";
+            HandleFrameName( name, tmp, 5 );
+        } );
 
-    m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
-    m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
+        m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
+        m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
+    }
 }
 
 Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
     : m_hasData( true )
     , m_stream( nullptr )
     , m_buffer( nullptr )
+    , m_inconsistentSamples( false )
 {
     auto loadStart = std::chrono::high_resolution_clock::now();
-
-    m_data.callstackPayload.push_back( nullptr );
 
     int fileVer = 0;
 
@@ -536,26 +585,9 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
     s_loadProgress.total.store( 11, std::memory_order_relaxed );
     s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
     s_loadProgress.progress.store( LoadProgress::Initialization, std::memory_order_relaxed );
-    f.Read5( m_resolution, m_timerMul, m_data.lastTime, m_data.frameOffset, m_pid );
-
-    if( fileVer >= FileVersion( 0, 6, 5 ) )
-    {
-        f.Read( m_samplingPeriod );
-    }
-    else
-    {
-        m_samplingPeriod = 0;
-    }
-    if( fileVer >= FileVersion( 0, 6, 7 ) )
-    {
-        f.Read( m_data.cpuArch );
-    }
-    if( fileVer >= FileVersion( 0, 6, 12 ) )
-    {
-        f.Read( m_data.cpuId );
-        f.Read( m_data.cpuManufacturer, 12 );
-        m_data.cpuManufacturer[12] = '\0';
-    }
+    f.Read8( m_resolution, m_timerMul, m_data.lastTime, m_data.frameOffset, m_pid, m_samplingPeriod, m_data.cpuArch, m_data.cpuId );
+    f.Read( m_data.cpuManufacturer, 12 );
+    m_data.cpuManufacturer[12] = '\0';
 
     uint64_t sz;
     {
@@ -590,32 +622,29 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         m_hostInfo = std::string( tmp, tmp+sz );
     }
 
-    if( fileVer >= FileVersion( 0, 6, 2 ) )
+    f.Read( sz );
+    m_data.cpuTopology.reserve( sz );
+    for( uint64_t i=0; i<sz; i++ )
     {
-        f.Read( sz );
-        m_data.cpuTopology.reserve( sz );
-        for( uint64_t i=0; i<sz; i++ )
+        uint32_t packageId;
+        uint64_t psz;
+        f.Read2( packageId, psz );
+        auto& package = *m_data.cpuTopology.emplace( packageId, unordered_flat_map<uint32_t, std::vector<uint32_t>> {} ).first;
+        package.second.reserve( psz );
+        for( uint64_t j=0; j<psz; j++ )
         {
-            uint32_t packageId;
-            uint64_t psz;
-            f.Read2( packageId, psz );
-            auto& package = *m_data.cpuTopology.emplace( packageId, unordered_flat_map<uint32_t, std::vector<uint32_t>> {} ).first;
-            package.second.reserve( psz );
-            for( uint64_t j=0; j<psz; j++ )
+            uint32_t coreId;
+            uint64_t csz;
+            f.Read2( coreId, csz );
+            auto& core = *package.second.emplace( coreId, std::vector<uint32_t> {} ).first;
+            core.second.reserve( csz );
+            for( uint64_t k=0; k<csz; k++ )
             {
-                uint32_t coreId;
-                uint64_t csz;
-                f.Read2( coreId, csz );
-                auto& core = *package.second.emplace( coreId, std::vector<uint32_t> {} ).first;
-                core.second.reserve( csz );
-                for( uint64_t k=0; k<csz; k++ )
-                {
-                    uint32_t thread;
-                    f.Read( thread );
-                    core.second.emplace_back( thread );
+                uint32_t thread;
+                f.Read( thread );
+                core.second.emplace_back( thread );
 
-                    m_data.cpuTopologyMap.emplace( thread, CpuThreadTopology { packageId, coreId } );
-                }
+                m_data.cpuTopologyMap.emplace( thread, CpuThreadTopology { packageId, coreId } );
             }
         }
     }
@@ -677,7 +706,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         auto dst = m_slab.Alloc<char>( ssz+1 );
         f.Read( dst, ssz );
         dst[ssz] = '\0';
-        m_data.stringMap.emplace( charutil::StringKey { dst, ssz }, i );
+        m_data.stringMap.emplace( charutil::StringKey { dst, size_t( ssz ) }, i );
         m_data.stringData[i] = ( dst );
         pointerMap.emplace( ptr, dst );
     }
@@ -762,6 +791,20 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         assert( status.second );
         status.first->second.zones.reserve( cnt );
     }
+
+    if( fileVer >= FileVersion( 0, 7, 15 ) )
+    {
+        f.Read( sz );
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            int16_t id;
+            uint64_t cnt;
+            f.Read2( id, cnt );
+            auto status = m_data.gpuSourceLocationZones.emplace( id, GpuSourceLocationZones() );
+            assert( status.second );
+            status.first->second.zones.reserve( cnt );
+        }
+    }
 #else
     f.Read( sz );
     for( uint64_t i=0; i<sz; i++ )
@@ -770,6 +813,18 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         f.Read( id );
         f.Skip( sizeof( uint64_t ) );
         m_data.sourceLocationZonesCnt.emplace( id, 0 );
+    }
+
+    if( fileVer >= FileVersion( 0, 7, 15 ) )
+    {
+        f.Read( sz );
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            int16_t id;
+            f.Read( id );
+            f.Skip( sizeof( uint64_t ) );
+            m_data.gpuSourceLocationZonesCnt.emplace( id, 0 );
+        }
     }
 #endif
 
@@ -785,12 +840,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
             auto& lockmap = *lockmapPtr;
             uint32_t id;
             uint64_t tsz;
-            f.Read( id );
-            if( fileVer >= FileVersion( 0, 6, 6 ) )
-            {
-                f.Read( lockmap.customName );
-            }
-            f.Read6( lockmap.srcloc, lockmap.type, lockmap.valid, lockmap.timeAnnounce, lockmap.timeTerminate, tsz );
+            f.Read8( id, lockmap.customName, lockmap.srcloc, lockmap.type, lockmap.valid, lockmap.timeAnnounce, lockmap.timeTerminate, tsz );
             lockmap.isContended = false;
             lockmap.threadMap.reserve( tsz );
             lockmap.threadList.reserve( tsz );
@@ -845,11 +895,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         {
             LockType type;
             uint64_t tsz;
-            if( fileVer >= FileVersion( 0, 6, 6 ) )
-            {
-                f.Skip( sizeof( LockMap::customName ) );
-            }
-            f.Skip( sizeof( uint32_t ) + sizeof( LockMap::srcloc ) );
+            f.Skip( sizeof( LockMap::customName ) + sizeof( uint32_t ) + sizeof( LockMap::srcloc ) );
             f.Read( type );
             f.Skip( sizeof( LockMap::valid ) + sizeof( LockMap::timeAnnounce ) + sizeof( LockMap::timeTerminate ) );
             f.Read( tsz );
@@ -890,7 +936,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         m_data.zoneExtra.reserve_exact( sz, m_slab );
         f.Read( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
     }
-    else if( fileVer >= FileVersion( 0, 6, 3 ) )
+    else
     {
         f.Read( sz );
         assert( sz != 0 );
@@ -901,10 +947,6 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
             f.Read3( zoneExtra->callstack, zoneExtra->text, zoneExtra->name );
             zoneExtra->color = 0;
         }
-    }
-    else
-    {
-        m_data.zoneExtra.push_back( ZoneExtra {} );
     }
 
     s_loadProgress.progress.store( LoadProgress::Zones, std::memory_order_relaxed );
@@ -921,35 +963,28 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
     {
         auto td = m_slab.AllocInit<ThreadData>();
         uint64_t tid;
-        if( fileVer >= FileVersion( 0, 7, 9 ) )
+        if( fileVer >= FileVersion( 0, 7, 11 ) )
+        {
+            f.Read4( tid, td->count, td->kernelSampleCnt, td->isFiber );
+        }
+        else if( fileVer >= FileVersion( 0, 7, 9 ) )
         {
             f.Read3( tid, td->count, td->kernelSampleCnt );
+            td->isFiber = 0;
         }
         else
         {
             f.Read2( tid, td->count );
             td->kernelSampleCnt = 0;
+            td->isFiber = 0;
         }
         td->id = tid;
         m_data.zonesCnt += td->count;
-        if( fileVer < FileVersion( 0, 6, 3 ) )
+        uint32_t tsz;
+        f.Read( tsz );
+        if( tsz != 0 )
         {
-            uint64_t tsz;
-            f.Read( tsz );
-            if( tsz != 0 )
-            {
-                int64_t refTime = 0;
-                ReadTimelinePre063( f, td->timeline, tsz, refTime, childIdx, fileVer );
-            }
-        }
-        else
-        {
-            uint32_t tsz;
-            f.Read( tsz );
-            if( tsz != 0 )
-            {
-                ReadTimeline( f, td->timeline, tsz, 0, childIdx );
-            }
+            ReadTimeline( f, td->timeline, tsz, 0, childIdx );
         }
         uint64_t msz;
         f.Read( msz );
@@ -970,7 +1005,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         {
             f.Skip( msz * sizeof( uint64_t ) );
         }
-        if( fileVer >= FileVersion( 0, 6, 4 ) )
+        if( fileVer >= FileVersion( 0, 7, 14 ) )
         {
             uint64_t ssz;
             f.Read( ssz );
@@ -978,10 +1013,9 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
             {
                 if( eventMask & EventType::Samples )
                 {
-                    m_data.samplesCnt += ssz;
                     int64_t refTime = 0;
-                    td->samples.reserve_exact( ssz, m_slab );
-                    auto ptr = td->samples.data();
+                    td->ctxSwitchSamples.reserve_exact( ssz, m_slab );
+                    auto ptr = td->ctxSwitchSamples.data();
                     for( uint64_t j=0; j<ssz; j++ )
                     {
                         ptr->time.SetVal( ReadTimeOffset( f, refTime ) );
@@ -993,6 +1027,28 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                 {
                     f.Skip( ssz * ( 8 + 3 ) );
                 }
+            }
+        }
+        uint64_t ssz;
+        f.Read( ssz );
+        if( ssz != 0 )
+        {
+            if( eventMask & EventType::Samples )
+            {
+                m_data.samplesCnt += ssz;
+                int64_t refTime = 0;
+                td->samples.reserve_exact( ssz, m_slab );
+                auto ptr = td->samples.data();
+                for( uint64_t j=0; j<ssz; j++ )
+                {
+                    ptr->time.SetVal( ReadTimeOffset( f, refTime ) );
+                    f.Read( &ptr->callstack, sizeof( ptr->callstack ) );
+                    ptr++;
+                }
+            }
+            else
+            {
+                f.Skip( ssz * ( 8 + 3 ) );
             }
         }
         m_data.threads[i] = td;
@@ -1035,15 +1091,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         else
         {
             uint8_t accuracy;
-            if( fileVer >= FileVersion( 0, 6, 14 ) )
-            {
-                f.Read5( ctx->thread, accuracy, ctx->count, ctx->period, ctx->type );
-            }
-            else
-            {
-                f.Read4( ctx->thread, accuracy, ctx->count, ctx->period );
-                ctx->type = ctx->thread == 0 ? GpuContextType::Vulkan : GpuContextType::OpenGl;
-            }
+            f.Read5( ctx->thread, accuracy, ctx->count, ctx->period, ctx->type );
             ctx->hasCalibration = false;
             ctx->overflow = 0;
         }
@@ -1072,34 +1120,113 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
     {
         m_data.plots.Data().reserve( sz );
         s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
-        for( uint64_t i=0; i<sz; i++ )
+        if( fileVer >= FileVersion( 0, 8, 3 ) )
         {
-            s_loadProgress.subProgress.store( i, std::memory_order_relaxed );
-            auto pd = m_slab.AllocInit<PlotData>();
-            uint64_t psz;
-            f.Read6( pd->type, pd->format, pd->name, pd->min, pd->max, psz );
-            pd->data.reserve_exact( psz, m_slab );
-            auto ptr = pd->data.data();
-            int64_t refTime = 0;
-            for( uint64_t j=0; j<psz; j++ )
+            for( uint64_t i=0; i<sz; i++ )
             {
-                int64_t t;
-                f.Read2( t, ptr->val );
-                refTime += t;
-                ptr->time = refTime;
-                ptr++;
+                s_loadProgress.subProgress.store( i, std::memory_order_relaxed );
+                auto pd = m_slab.AllocInit<PlotData>();
+                uint64_t psz;
+                f.Read10( pd->type, pd->format, pd->showSteps, pd->fill, pd->color, pd->name, pd->min, pd->max, pd->sum, psz );
+                pd->data.reserve_exact( psz, m_slab );
+                auto ptr = pd->data.data();
+                int64_t refTime = 0;
+                for( uint64_t j=0; j<psz; j++ )
+                {
+                    int64_t t;
+                    f.Read2( t, ptr->val );
+                    refTime += t;
+                    ptr->time = refTime;
+                    ptr++;
+                }
+                m_data.plots.Data().push_back_no_space_check( pd );
             }
-            m_data.plots.Data().push_back_no_space_check( pd );
+        }
+        else if( fileVer >= FileVersion( 0, 7, 10 ) )
+        {
+            for( uint64_t i=0; i<sz; i++ )
+            {
+                s_loadProgress.subProgress.store( i, std::memory_order_relaxed );
+                auto pd = m_slab.AllocInit<PlotData>();
+                uint64_t psz;
+                f.Read7( pd->type, pd->format, pd->name, pd->min, pd->max, pd->sum, psz );
+                pd->showSteps = false;
+                pd->fill = true;
+                pd->color = 0;
+                pd->data.reserve_exact( psz, m_slab );
+                auto ptr = pd->data.data();
+                int64_t refTime = 0;
+                for( uint64_t j=0; j<psz; j++ )
+                {
+                    int64_t t;
+                    f.Read2( t, ptr->val );
+                    refTime += t;
+                    ptr->time = refTime;
+                    ptr++;
+                }
+                m_data.plots.Data().push_back_no_space_check( pd );
+            }
+        }
+        else
+        {
+            for( uint64_t i=0; i<sz; i++ )
+            {
+                s_loadProgress.subProgress.store( i, std::memory_order_relaxed );
+                auto pd = m_slab.AllocInit<PlotData>();
+                uint64_t psz;
+                f.Read6( pd->type, pd->format, pd->name, pd->min, pd->max, psz );
+                pd->sum = 0;
+                pd->showSteps = false;
+                pd->fill = true;
+                pd->color = 0;
+                pd->data.reserve_exact( psz, m_slab );
+                auto ptr = pd->data.data();
+                int64_t refTime = 0;
+                for( uint64_t j=0; j<psz; j++ )
+                {
+                    int64_t t;
+                    f.Read2( t, ptr->val );
+                    pd->sum += ptr->val;
+                    refTime += t;
+                    ptr->time = refTime;
+                    ptr++;
+                }
+                m_data.plots.Data().push_back_no_space_check( pd );
+            }
         }
     }
     else
     {
-        for( uint64_t i=0; i<sz; i++ )
+        if( fileVer >= FileVersion( 0, 8, 3 ) )
         {
-            f.Skip( sizeof( PlotData::name ) + sizeof( PlotData::min ) + sizeof( PlotData::max ) + sizeof( PlotData::type ) + sizeof( PlotData::format ) );
-            uint64_t psz;
-            f.Read( psz );
-            f.Skip( psz * ( sizeof( uint64_t ) + sizeof( double ) ) );
+            for( uint64_t i=0; i<sz; i++ )
+            {
+                f.Skip( sizeof( PlotData::name ) + sizeof( PlotData::min ) + sizeof( PlotData::max ) + sizeof( PlotData::sum ) + sizeof( PlotData::type ) + sizeof( PlotData::format ) + sizeof( PlotData::showSteps ) + sizeof( PlotData::fill ) + sizeof( PlotData::color ) );
+                uint64_t psz;
+                f.Read( psz );
+                f.Skip( psz * ( sizeof( uint64_t ) + sizeof( double ) ) );
+            }
+
+        }
+        else if( fileVer >= FileVersion( 0, 7, 10 ) )
+        {
+            for( uint64_t i=0; i<sz; i++ )
+            {
+                f.Skip( sizeof( PlotData::name ) + sizeof( PlotData::min ) + sizeof( PlotData::max ) + sizeof( PlotData::sum ) + sizeof( PlotData::type ) + sizeof( PlotData::format ) );
+                uint64_t psz;
+                f.Read( psz );
+                f.Skip( psz * ( sizeof( uint64_t ) + sizeof( double ) ) );
+            }
+        }
+        else
+        {
+            for( uint64_t i=0; i<sz; i++ )
+            {
+                f.Skip( sizeof( PlotData::name ) + sizeof( PlotData::min ) + sizeof( PlotData::max ) + sizeof( PlotData::type ) + sizeof( PlotData::format ) );
+                uint64_t psz;
+                f.Read( psz );
+                f.Skip( psz * ( sizeof( uint64_t ) + sizeof( double ) ) );
+            }
         }
     }
 
@@ -1238,81 +1365,37 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
     s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
     s_loadProgress.progress.store( LoadProgress::CallStacks, std::memory_order_relaxed );
     f.Read( sz );
-    m_data.callstackPayload.reserve( sz );
-    if( fileVer >= FileVersion( 0, 6, 8 ) )
+    m_data.callstackPayload.reserve_exact( sz+1, m_slab );
+    m_data.callstackPayload[0] = nullptr;
+    for( uint64_t i=0; i<sz; i++ )
     {
-        for( uint64_t i=0; i<sz; i++ )
-        {
-            uint16_t csz;
-            f.Read( csz );
+        uint16_t csz;
+        f.Read( csz );
 
-            const auto memsize = sizeof( VarArray<CallstackFrameId> ) + csz * sizeof( CallstackFrameId );
-            auto mem = (char*)m_slab.AllocRaw( memsize );
+        const auto memsize = sizeof( VarArray<CallstackFrameId> ) + csz * sizeof( CallstackFrameId );
+        auto mem = (char*)m_slab.AllocRaw( memsize );
 
-            auto data = (CallstackFrameId*)mem;
-            f.Read( data, csz * sizeof( CallstackFrameId ) );
+        auto data = (CallstackFrameId*)mem;
+        f.Read( data, csz * sizeof( CallstackFrameId ) );
 
-            auto arr = (VarArray<CallstackFrameId>*)( mem + csz * sizeof( CallstackFrameId ) );
-            new(arr) VarArray<CallstackFrameId>( csz, data );
+        auto arr = (VarArray<CallstackFrameId>*)( mem + csz * sizeof( CallstackFrameId ) );
+        new(arr) VarArray<CallstackFrameId>( csz, data );
 
-            m_data.callstackPayload.push_back_no_space_check( arr );
-        }
-    }
-    else
-    {
-        for( uint64_t i=0; i<sz; i++ )
-        {
-            uint8_t csz;
-            f.Read( csz );
-
-            const auto memsize = sizeof( VarArray<CallstackFrameId> ) + csz * sizeof( CallstackFrameId );
-            auto mem = (char*)m_slab.AllocRaw( memsize );
-
-            auto data = (CallstackFrameId*)mem;
-            f.Read( data, csz * sizeof( CallstackFrameId ) );
-
-            auto arr = (VarArray<CallstackFrameId>*)( mem + csz * sizeof( CallstackFrameId ) );
-            new(arr) VarArray<CallstackFrameId>( csz, data );
-
-            m_data.callstackPayload.push_back_no_space_check( arr );
-        }
+        m_data.callstackPayload[i+1] = arr;
     }
 
-    if( fileVer >= FileVersion( 0, 6, 5 ) )
+    f.Read( sz );
+    m_data.callstackFrameMap.reserve( sz );
+    for( uint64_t i=0; i<sz; i++ )
     {
-        f.Read( sz );
-        m_data.callstackFrameMap.reserve( sz );
-        for( uint64_t i=0; i<sz; i++ )
-        {
-            CallstackFrameId id;
-            auto frameData = m_slab.Alloc<CallstackFrameData>();
-            f.Read3( id, frameData->size, frameData->imageName );
+        CallstackFrameId id;
+        auto frameData = m_slab.Alloc<CallstackFrameData>();
+        f.Read3( id, frameData->size, frameData->imageName );
 
-            frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
-            f.Read( frameData->data, sizeof( CallstackFrame ) * frameData->size );
+        frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
+        f.Read( frameData->data, sizeof( CallstackFrame ) * frameData->size );
 
-            m_data.callstackFrameMap.emplace( id, frameData );
-        }
-    }
-    else
-    {
-        f.Read( sz );
-        m_data.callstackFrameMap.reserve( sz );
-        for( uint64_t i=0; i<sz; i++ )
-        {
-            CallstackFrameId id;
-            auto frameData = m_slab.AllocInit<CallstackFrameData>();
-            f.Read2( id, frameData->size );
-
-            frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
-            for( uint8_t j=0; j<frameData->size; j++ )
-            {
-                f.Read3( frameData->data[j].name, frameData->data[j].file, frameData->data[j].line );
-                frameData->data[j].symAddr = 0;
-            }
-
-            m_data.callstackFrameMap.emplace( id, frameData );
-        }
+        m_data.callstackFrameMap.emplace( id, frameData );
     }
 
     f.Read( sz );
@@ -1356,9 +1439,13 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                 alignas(64) std::atomic<State> state = Available;
             };
 
+#ifdef __EMSCRIPTEN__
+            const int jobs = 1;
+#else
             // Leave one thread for file reader, second thread for dispatch (this thread)
             // Minimum 2 threads to have at least two buffers (one in use, second one filling up)
             const auto jobs = std::max<int>( std::thread::hardware_concurrency() - 2, 2 );
+#endif
             auto td = std::make_unique<TaskDispatch>( jobs );
             auto data = std::make_unique<JobData[]>( jobs );
 
@@ -1401,8 +1488,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                 data[idx].fi = fi;
 
                 data[idx].state.store( JobData::InProgress, std::memory_order_release );
-                td->Queue( [this, &data, idx, fi, fileVer, cdict] {
-                    if( fileVer <= FileVersion( 0, 6, 9 ) ) m_texcomp.Rdo( data[idx].buf, fi->w * fi->h / 16 );
+                td->Queue( [this, &data, idx, fi, cdict] {
                     if( cdict )
                     {
                         fi->csz = m_texcomp.Pack( data[idx].ctx, cdict, data[idx].outbuf, data[idx].outsz, data[idx].buf, fi->w * fi->h / 2 );
@@ -1487,20 +1573,43 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
             int64_t runningTime = 0;
             int64_t refTime = 0;
             auto ptr = data->v.data();
-            for( uint64_t j=0; j<csz; j++ )
+            if( fileVer >= FileVersion( 0, 7, 12 ) )
             {
-                int64_t deltaWakeup, deltaStart, diff;
-                uint8_t cpu;
-                int8_t reason, state;
-                f.Read6( deltaWakeup, deltaStart, diff, cpu, reason, state );
-                refTime += deltaWakeup;
-                ptr->SetWakeup( refTime );
-                refTime += deltaStart;
-                ptr->SetStartCpu( refTime, cpu );
-                if( diff > 0 ) runningTime += diff;
-                refTime += diff;
-                ptr->SetEndReasonState( refTime, reason, state );
-                ptr++;
+                for( uint64_t j=0; j<csz; j++ )
+                {
+                    int64_t deltaWakeup, deltaStart, diff, thread;
+                    uint8_t cpu;
+                    int8_t reason, state;
+                    f.Read7( deltaWakeup, deltaStart, diff, cpu, reason, state, thread );
+                    refTime += deltaWakeup;
+                    ptr->SetWakeup( refTime );
+                    refTime += deltaStart;
+                    ptr->SetStartCpu( refTime, cpu );
+                    if( diff > 0 ) runningTime += diff;
+                    refTime += diff;
+                    ptr->SetEndReasonState( refTime, reason, state );
+                    ptr->SetThread( CompressThread( thread ) );
+                    ptr++;
+                }
+            }
+            else
+            {
+                for( uint64_t j=0; j<csz; j++ )
+                {
+                    int64_t deltaWakeup, deltaStart, diff;
+                    uint8_t cpu;
+                    int8_t reason, state;
+                    f.Read6( deltaWakeup, deltaStart, diff, cpu, reason, state );
+                    refTime += deltaWakeup;
+                    ptr->SetWakeup( refTime );
+                    refTime += deltaStart;
+                    ptr->SetStartCpu( refTime, cpu );
+                    if( diff > 0 ) runningTime += diff;
+                    refTime += diff;
+                    ptr->SetEndReasonState( refTime, reason, state );
+                    ptr->SetThread( 0 );
+                    ptr++;
+                }
             }
             data->runningTime = runningTime;
             m_data.ctxSwitch.emplace( thread, data );
@@ -1516,7 +1625,14 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
             f.Skip( sizeof( uint64_t ) );
             uint64_t csz;
             f.Read( csz );
-            f.Skip( csz * ( sizeof( int64_t ) * 3 + sizeof( int8_t ) * 3 ) );
+            if( fileVer >= FileVersion( 0, 7, 12 ) )
+            {
+                f.Skip( csz * ( sizeof( int64_t ) * 4 + sizeof( int8_t ) * 3 ) );
+            }
+            else
+            {
+                f.Skip( csz * ( sizeof( int64_t ) * 3 + sizeof( int8_t ) * 3 ) );
+            }
         }
     }
 
@@ -1578,159 +1694,106 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
         m_data.cpuThreadData.emplace( tid, data );
     }
 
-    if( fileVer >= FileVersion( 0, 6, 7 ) )
+    f.Read( sz );
+    m_data.symbolLoc.reserve_exact( sz, m_slab );
+    f.Read( sz );
+    if( fileVer < FileVersion( 0, 7, 2 ) )
     {
-        if( fileVer >= FileVersion( 0, 6, 11 ) )
+        m_data.symbolLocInline.reserve_exact( sz + 1, m_slab );
+    }
+    else
+    {
+        m_data.symbolLocInline.reserve_exact( sz, m_slab );
+    }
+    f.Read( sz );
+    m_data.symbolMap.reserve( sz );
+    int symIdx = 0;
+    int symInlineIdx = 0;
+    for( uint64_t i=0; i<sz; i++ )
+    {
+        uint64_t symAddr;
+        StringIdx name, file, imageName, callFile;
+        uint32_t line, callLine;
+        uint8_t isInline;
+        Int24 size;
+        f.Read9( symAddr, name, file, line, imageName, callFile, callLine, isInline, size );
+        m_data.symbolMap.emplace( symAddr, SymbolData { { name, file, line }, imageName, callFile, callLine, isInline, size } );
+        if( isInline )
         {
-            f.Read( sz );
-            m_data.symbolLoc.reserve_exact( sz, m_slab );
-            f.Read( sz );
-            if( fileVer < FileVersion( 0, 7, 2 ) )
-            {
-                m_data.symbolLocInline.reserve_exact( sz + 1, m_slab );
-            }
-            else
-            {
-                m_data.symbolLocInline.reserve_exact( sz, m_slab );
-            }
-            f.Read( sz );
-            m_data.symbolMap.reserve( sz );
-            int symIdx = 0;
-            int symInlineIdx = 0;
-            for( uint64_t i=0; i<sz; i++ )
-            {
-                uint64_t symAddr;
-                StringIdx name, file, imageName, callFile;
-                uint32_t line, callLine;
-                uint8_t isInline;
-                Int24 size;
-                f.Read9( symAddr, name, file, line, imageName, callFile, callLine, isInline, size );
-                m_data.symbolMap.emplace( symAddr, SymbolData { name, file, line, imageName, callFile, callLine, isInline, size } );
-                if( isInline )
-                {
-                    m_data.symbolLocInline[symInlineIdx++] = symAddr;
-                }
-                else
-                {
-                    m_data.symbolLoc[symIdx++] = SymbolLocation { symAddr, size.Val() };
-                }
-            }
-            if( fileVer < FileVersion( 0, 7, 2 ) )
-            {
-                m_data.symbolLocInline[symInlineIdx] = std::numeric_limits<uint64_t>::max();
-            }
+            m_data.symbolLocInline[symInlineIdx++] = symAddr;
         }
         else
         {
-            f.Read( sz );
-            m_data.symbolMap.reserve( sz );
-            for( uint64_t i=0; i<sz; i++ )
-            {
-                uint64_t symAddr;
-                StringIdx name, file, imageName, callFile;
-                uint32_t line, callLine;
-                uint8_t isInline;
-                Int24 size;
-                f.Read9( symAddr, name, file, line, imageName, callFile, callLine, isInline, size );
-                m_data.symbolMap.emplace( symAddr, SymbolData { name, file, line, imageName, callFile, callLine, isInline, size } );
-                if( isInline )
-                {
-                    m_data.symbolLocInline.push_back( symAddr );
-                }
-                else
-                {
-                    m_data.symbolLoc.push_back( SymbolLocation { symAddr, size.Val() } );
-                }
-            }
-            m_data.symbolLocInline.push_back( std::numeric_limits<uint64_t>::max() );
+            m_data.symbolLoc[symIdx++] = SymbolLocation { symAddr, size.Val() };
         }
-#ifdef NO_PARALLEL_SORT
-        pdqsort_branchless( m_data.symbolLoc.begin(), m_data.symbolLoc.end(), [] ( const auto& l, const auto& r ) { return l.addr < r.addr; } );
-        pdqsort_branchless( m_data.symbolLocInline.begin(), m_data.symbolLocInline.end() );
-#else
-        std::sort( std::execution::par_unseq, m_data.symbolLoc.begin(), m_data.symbolLoc.end(), [] ( const auto& l, const auto& r ) { return l.addr < r.addr; } );
-        std::sort( std::execution::par_unseq, m_data.symbolLocInline.begin(), m_data.symbolLocInline.end() );
-#endif
     }
-    else if( fileVer >= FileVersion( 0, 6, 5 ) )
+    if( fileVer < FileVersion( 0, 7, 2 ) )
     {
-        f.Read( sz );
-        m_data.symbolMap.reserve( sz );
+        m_data.symbolLocInline[symInlineIdx] = std::numeric_limits<uint64_t>::max();
+    }
+#ifdef NO_PARALLEL_SORT
+    pdqsort_branchless( m_data.symbolLoc.begin(), m_data.symbolLoc.end(), [] ( const auto& l, const auto& r ) { return l.addr < r.addr; } );
+    pdqsort_branchless( m_data.symbolLocInline.begin(), m_data.symbolLocInline.end() );
+#else
+    std::sort( std::execution::par_unseq, m_data.symbolLoc.begin(), m_data.symbolLoc.end(), [] ( const auto& l, const auto& r ) { return l.addr < r.addr; } );
+    std::sort( std::execution::par_unseq, m_data.symbolLocInline.begin(), m_data.symbolLocInline.end() );
+#endif
+
+    f.Read( sz );
+    if( eventMask & EventType::SymbolCode )
+    {
+        uint64_t ssz = 0;
+        m_data.symbolCode.reserve( sz );
         for( uint64_t i=0; i<sz; i++ )
         {
             uint64_t symAddr;
-            StringIdx name, file, imageName, callFile;
-            uint32_t line, callLine;
-            uint8_t isInline;
-            f.Read8( symAddr, name, file, line, imageName, callFile, callLine, isInline );
-            m_data.symbolMap.emplace( symAddr, SymbolData { name, file, line, imageName, callFile, callLine, isInline } );
+            uint32_t len;
+            f.Read2( symAddr, len );
+            ssz += len;
+            auto ptr = (char*)m_slab.AllocBig( len );
+            f.Read( ptr, len );
+            m_data.symbolCode.emplace( symAddr, MemoryBlock { ptr, len } );
+        }
+        m_data.symbolCodeSize = ssz;
+    }
+    else
+    {
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            uint64_t symAddr;
+            uint32_t len;
+            f.Read2( symAddr, len );
+            f.Skip( len );
         }
     }
 
-    if( fileVer >= FileVersion( 0, 6, 7 ) )
+    if( fileVer <= FileVersion( 0, 8, 4 ) )
     {
         f.Read( sz );
-        if( eventMask & EventType::SymbolCode )
+        for( uint64_t i=0; i<sz; i++ )
         {
-            uint64_t ssz = 0;
-            m_data.symbolCode.reserve( sz );
-            for( uint64_t i=0; i<sz; i++ )
+            uint64_t packed;
+            uint16_t lsz;
+            f.Read2( packed, lsz );
+            uint32_t line;
+            const auto fidx = UnpackFileLine( packed, line );
+            uint64_t ref = 0;
+            for( uint16_t j=0; j<lsz; j++ )
             {
-                uint64_t symAddr;
-                uint32_t len;
-                f.Read2( symAddr, len );
-                ssz += len;
-                auto ptr = (char*)m_slab.AllocBig( len );
-                f.Read( ptr, len );
-                m_data.symbolCode.emplace( symAddr, MemoryBlock { ptr, len } );
-            }
-            m_data.symbolCodeSize = ssz;
-        }
-        else
-        {
-            for( uint64_t i=0; i<sz; i++ )
-            {
-                uint64_t symAddr;
-                uint32_t len;
-                f.Read2( symAddr, len );
-                f.Skip( len );
-            }
-        }
-    }
-
-    if( fileVer >= FileVersion( 0, 6, 9 ) )
-    {
-        f.Read( sz );
-        if( eventMask & EventType::SymbolCode )
-        {
-            m_data.locationCodeAddressList.reserve( sz );
-            for( uint64_t i=0; i<sz; i++ )
-            {
-                uint64_t packed;
-                uint16_t lsz;
-                f.Read2( packed, lsz );
-                Vector<uint64_t> data;
-                data.reserve_exact( lsz, m_slab );
-                uint64_t ref = 0;
-                for( uint16_t j=0; j<lsz; j++ )
+                uint64_t diff;
+                f.Read( diff );
+                ref += diff;
+                auto frameId = PackPointer( ref );
+                if( m_data.callstackFrameMap.find( frameId ) == m_data.callstackFrameMap.end() )
                 {
-                    uint64_t diff;
-                    f.Read( diff );
-                    ref += diff;
-                    data[j] = ref;
-                    m_data.codeAddressToLocation.emplace( ref, packed );
+                    auto cs = m_slab.AllocInit<CallstackFrameData>();
+                    cs->size = 1;
+                    cs->data = m_slab.AllocInit<CallstackFrame>( 1 );
+                    cs->data->file = StringIdx( fidx );
+                    cs->data->line = line;
+                    cs->data->symAddr = 0;
+                    m_data.callstackFrameMap.emplace( frameId, cs );
                 }
-                m_data.locationCodeAddressList.emplace( packed, std::move( data ) );
-            }
-        }
-        else
-        {
-            for( uint64_t i=0; i<sz; i++ )
-            {
-                uint64_t packed;
-                uint16_t lsz;
-                f.Read2( packed, lsz );
-                f.Skip( lsz * sizeof( uint64_t ) );
             }
         }
     }
@@ -1757,40 +1820,37 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
             ReadHwSampleVec( f, data.retired, m_slab );
             ReadHwSampleVec( f, data.cacheRef, m_slab );
             ReadHwSampleVec( f, data.cacheMiss, m_slab );
-            ReadHwSampleVec( f, data.branchRetired, m_slab );
+            if( ReadHwSampleVec( f, data.branchRetired, m_slab ) != 0 ) m_data.hasBranchRetirement = true;
             ReadHwSampleVec( f, data.branchMiss, m_slab );
         }
     }
 
-    if( fileVer >= FileVersion( 0, 6, 13 ) )
+    f.Read( sz );
+    if( eventMask & EventType::SourceCache )
     {
-        f.Read( sz );
-        if( eventMask & EventType::SourceCache )
+        m_data.sourceFileCache.reserve( sz );
+        for( uint64_t i=0; i<sz; i++ )
         {
-            m_data.sourceFileCache.reserve( sz );
-            for( uint64_t i=0; i<sz; i++ )
-            {
-                uint32_t len;
-                f.Read( len );
-                auto key = m_slab.Alloc<char>( len+1 );
-                f.Read( key, len );
-                key[len] = '\0';
-                f.Read( len );
-                auto data = (char*)m_slab.AllocBig( len );
-                f.Read( data, len );
-                m_data.sourceFileCache.emplace( key, MemoryBlock { data, len } );
-            }
+            uint32_t len;
+            f.Read( len );
+            auto key = m_slab.Alloc<char>( len+1 );
+            f.Read( key, len );
+            key[len] = '\0';
+            f.Read( len );
+            auto data = (char*)m_slab.AllocBig( len );
+            f.Read( data, len );
+            m_data.sourceFileCache.emplace( key, MemoryBlock { data, len } );
         }
-        else
+    }
+    else
+    {
+        for( uint64_t i=0; i<sz; i++ )
         {
-            for( uint64_t i=0; i<sz; i++ )
-            {
-                uint32_t s32;
-                f.Read( s32 );
-                f.Skip( s32 );
-                f.Read( s32 );
-                f.Skip( s32 );
-            }
+            uint32_t s32;
+            f.Read( s32 );
+            f.Skip( s32 );
+            f.Read( s32 );
+            f.Skip( s32 );
         }
     }
 
@@ -1805,10 +1865,18 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
     {
         m_backgroundDone.store( false, std::memory_order_relaxed );
 #ifndef TRACY_NO_STATISTICS
+        if( fileVer < FileVersion( 0, 7, 13 ) )
+        {
+            for( auto& t : m_data.threads )
+            {
+                pdqsort_branchless( t->samples.begin(), t->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
+            }
+        }
+
         m_threadBackground = std::thread( [this, eventMask] {
             std::vector<std::thread> jobs;
 
-            if( !m_data.ctxSwitch.empty() )
+            if( !m_data.ctxSwitch.empty() && m_data.cpuDataCount != 0 )
             {
                 jobs.emplace_back( std::thread( [this] { ReconstructContextSwitchUsage(); } ) );
             }
@@ -1818,8 +1886,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                 if( mem.second->reconstruct ) jobs.emplace_back( std::thread( [this, mem = mem.second] { ReconstructMemAllocPlot( *mem ); } ) );
             }
 
-            std::function<void(SrcLocCountMap&, Vector<short_ptr<ZoneEvent>>&, uint16_t)> ProcessTimeline;
-            ProcessTimeline = [this, &ProcessTimeline] ( SrcLocCountMap& countMap, Vector<short_ptr<ZoneEvent>>& _vec, uint16_t thread )
+            std::function<void(uint8_t*, Vector<short_ptr<ZoneEvent>>&, uint16_t)> ProcessTimeline;
+            ProcessTimeline = [this, &ProcessTimeline] ( uint8_t* countMap, Vector<short_ptr<ZoneEvent>>& _vec, uint16_t thread )
             {
                 if( m_shutdown.load( std::memory_order_relaxed ) ) return;
                 assert( _vec.is_magic() );
@@ -1829,9 +1897,9 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                     if( zone.IsEndValid() ) ReconstructZoneStatistics( countMap, zone, thread );
                     if( zone.HasChildren() )
                     {
-                        IncSrcLocCount( countMap, zone.SrcLoc() );
+                        countMap[uint16_t(zone.SrcLoc())]++;
                         ProcessTimeline( countMap, GetZoneChildrenMutable( zone.Child() ), thread );
-                        DecSrcLocCount( countMap, zone.SrcLoc() );
+                        countMap[uint16_t(zone.SrcLoc())]--;
                     }
                 }
             };
@@ -1842,11 +1910,45 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                     if( m_shutdown.load( std::memory_order_relaxed ) ) return;
                     if( !t->timeline.empty() )
                     {
-                        SrcLocCountMap countMap;
+                        uint8_t countMap[64*1024];
                         // Don't touch thread compression cache in a thread.
                         ProcessTimeline( countMap, t->timeline, m_data.localThreadCompress.DecompressMustRaw( t->id ) );
                     }
                 }
+                std::lock_guard<std::mutex> lock( m_data.lock );
+                m_data.sourceLocationZonesReady = true;
+            } ) );
+
+            std::function<void(Vector<short_ptr<GpuEvent>>&, uint16_t)> ProcessTimelineGpu;
+            ProcessTimelineGpu = [this, &ProcessTimelineGpu] ( Vector<short_ptr<GpuEvent>>& _vec, uint16_t thread )
+            {
+                if( m_shutdown.load( std::memory_order_relaxed ) ) return;
+                assert( _vec.is_magic() );
+                auto& vec = *(Vector<GpuEvent>*)( &_vec );
+                for( auto& zone : vec )
+                {
+                    if( zone.GpuEnd() >= 0 ) ReconstructZoneStatistics( zone, thread );
+                    if( zone.Child() >= 0 )
+                    {
+                        ProcessTimelineGpu( GetGpuChildrenMutable( zone.Child() ), thread );
+                    }
+                }
+            };
+
+            jobs.emplace_back( std::thread( [this, ProcessTimelineGpu] {
+                for( auto& t : m_data.gpuData )
+                {
+                    for( auto& td : t->threadData )
+                    {
+                        if( m_shutdown.load( std::memory_order_relaxed ) ) return;
+                        if( !td.second.timeline.empty() )
+                        {
+                            ProcessTimelineGpu( td.second.timeline, td.first );
+                        }
+                    }
+                }
+                std::lock_guard<std::mutex> lock( m_data.lock );
+                m_data.gpuSourceLocationZonesReady = true;
             } ) );
 
             if( eventMask & EventType::Samples )
@@ -1860,40 +1962,51 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                         for( auto& t : m_data.threads )
                         {
                             if( m_shutdown.load( std::memory_order_relaxed ) ) return;
+                            auto cit = t->ctxSwitchSamples.begin();
                             for( auto& sd : t->samples )
                             {
-                                const auto cs = sd.callstack.Val();
-                                auto it = counts.find( cs );
-                                if( it == counts.end() )
+                                bool isCtxSwitch = false;
+                                if( cit != t->ctxSwitchSamples.end() )
                                 {
-                                    counts.emplace( cs, 1 );
+                                    const auto sdt = sd.time.Val();
+                                    cit = std::lower_bound( cit, t->ctxSwitchSamples.end(), sdt, []( const auto& l, const auto& r ) { return (uint64_t)l.time.Val() < (uint64_t)r; } );
+                                    isCtxSwitch = cit != t->ctxSwitchSamples.end() && cit->time.Val() == sdt;
                                 }
-                                else
+                                if( !isCtxSwitch )
                                 {
-                                    it->second++;
-                                }
-
-                                const auto& callstack = GetCallstack( cs );
-                                auto& ip = callstack[0];
-                                auto frame = GetCallstackFrame( ip );
-                                if( frame )
-                                {
-                                    const auto symAddr = frame->data[0].symAddr;
-                                    auto it = m_data.instructionPointersMap.find( symAddr );
-                                    if( it == m_data.instructionPointersMap.end() )
+                                    const auto cs = sd.callstack.Val();
+                                    auto it = counts.find( cs );
+                                    if( it == counts.end() )
                                     {
-                                        m_data.instructionPointersMap.emplace( symAddr, unordered_flat_map<CallstackFrameId, uint32_t, CallstackFrameIdHash, CallstackFrameIdCompare> { { ip, 1 } } );
+                                        counts.emplace( cs, 1 );
                                     }
                                     else
                                     {
-                                        auto fit = it->second.find( ip );
-                                        if( fit == it->second.end() )
+                                        it->second++;
+                                    }
+
+                                    const auto& callstack = GetCallstack( cs );
+                                    auto& ip = callstack[0];
+                                    auto frame = GetCallstackFrame( ip );
+                                    if( frame )
+                                    {
+                                        const auto symAddr = frame->data[0].symAddr;
+                                        auto it = m_data.instructionPointersMap.find( symAddr );
+                                        if( it == m_data.instructionPointersMap.end() )
                                         {
-                                            it->second.emplace( ip, 1 );
+                                            m_data.instructionPointersMap.emplace( symAddr, unordered_flat_map<CallstackFrameId, uint32_t, CallstackFrameIdHash, CallstackFrameIdCompare> { { ip, 1 } } );
                                         }
                                         else
                                         {
-                                            fit->second++;
+                                            auto fit = it->second.find( ip );
+                                            if( fit == it->second.end() )
+                                            {
+                                                it->second.emplace( ip, 1 );
+                                            }
+                                            else
+                                            {
+                                                fit->second++;
+                                            }
                                         }
                                     }
                                 }
@@ -1910,11 +2023,23 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                     for( auto& t : m_data.threads )
                     {
                         if( m_shutdown.load( std::memory_order_relaxed ) ) return;
-                        // TODO remove when proper sample order is achieved during capture
-                        pdqsort_branchless( t->samples.begin(), t->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
-                        for( auto& sd : t->samples )
+                        if( !t->samples.empty() )
                         {
-                            gcnt += AddGhostZone( GetCallstack( sd.callstack.Val() ), &t->ghostZones, sd.time.Val() );
+                            if( t->samples[0].time.Val() != 0 )
+                            {
+                                for( auto& sd : t->samples )
+                                {
+                                    gcnt += AddGhostZone( GetCallstack( sd.callstack.Val() ), &t->ghostZones, sd.time.Val() );
+                                }
+                            }
+                            else
+                            {
+                                for( auto& sd : t->samples )
+                                {
+                                    const auto st = sd.time.Val();
+                                    if( st != 0 ) gcnt += AddGhostZone( GetCallstack( sd.callstack.Val() ), &t->ghostZones, st );
+                                }
+                            }
                         }
                     }
                     std::lock_guard<std::mutex> lock( m_data.lock );
@@ -1925,6 +2050,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                 jobs.emplace_back( std::thread( [this] {
                     for( auto& t : m_data.threads )
                     {
+                        uint16_t tid = CompressThread( t->id );
                         for( auto& v : t->samples )
                         {
                             const auto& time = v.time;
@@ -1938,25 +2064,27 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                                 auto it = m_data.symbolSamples.find( symAddr );
                                 if( it == m_data.symbolSamples.end() )
                                 {
-                                    m_data.symbolSamples.emplace( symAddr, Vector<SampleDataRange>( SampleDataRange { time, ip } ) );
+                                    m_data.symbolSamples.emplace( symAddr, Vector<SampleDataRange>( SampleDataRange { time, tid, ip } ) );
                                 }
                                 else
                                 {
-                                    it->second.push_back_non_empty( SampleDataRange { time, ip } );
+                                    it->second.push_back_non_empty( SampleDataRange { time, tid, ip } );
                                 }
                             }
+                            auto childAddr = GetCanonicalPointer( callstack[0] );
                             for( uint16_t i=1; i<callstack.size(); i++ )
                             {
                                 auto addr = GetCanonicalPointer( callstack[i] );
                                 auto it = m_data.childSamples.find( addr );
                                 if( it == m_data.childSamples.end() )
                                 {
-                                    m_data.childSamples.emplace( addr, Vector<Int48>( time ) );
+                                    m_data.childSamples.emplace( addr, Vector<ChildSample>( ChildSample { time, childAddr } ) );
                                 }
                                 else
                                 {
-                                    it->second.push_back_non_empty( time );
+                                    it->second.push_back_non_empty( ChildSample { time, childAddr } );
                                 }
+                                childAddr = addr;
                             }
                         }
                     }
@@ -1966,7 +2094,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
                     }
                     for( auto& v : m_data.childSamples )
                     {
-                        pdqsort_branchless( v.second.begin(), v.second.end(), []( const auto& lhs, const auto& rhs ) { return lhs.Val() < rhs.Val(); } );
+                        pdqsort_branchless( v.second.begin(), v.second.end(), []( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
                     }
                     std::lock_guard<std::mutex> lock( m_data.lock );
                     m_data.symbolSamplesReady = true;
@@ -1974,17 +2102,6 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks )
             }
 
             for( auto& job : jobs ) job.join();
-
-            for( auto& v : m_data.sourceLocationZones )
-            {
-                if( m_shutdown.load( std::memory_order_relaxed ) ) return;
-                if( !v.second.zones.is_sorted() ) v.second.zones.sort();
-            }
-            {
-                std::lock_guard<std::mutex> lock( m_data.lock );
-                m_data.sourceLocationZonesReady = true;
-            }
-
             m_backgroundDone.store( true, std::memory_order_relaxed );
         } );
 #else
@@ -2011,7 +2128,6 @@ Worker::~Worker()
     {
         v->timeline.~Vector();
         v->stack.~Vector();
-        v->stackCount.~Table();
         v->messages.~Vector();
         v->zoneIdStack.~Vector();
         v->samples.~Vector();
@@ -2043,6 +2159,10 @@ Worker::~Worker()
     for( auto& v : m_data.zoneChildren )
     {
         v.~Vector();
+    }
+    for( auto& v : m_data.memNameMap )
+    {
+        v.second->~MemData();
     }
     for( auto& v : m_data.ctxSwitch )
     {
@@ -2123,6 +2243,16 @@ uint64_t Worker::GetChildSamplesCountFull() const
     for( auto& v : m_data.childSamples )
     {
         cnt += v.second.size();
+    }
+    return cnt;
+}
+
+uint64_t Worker::GetContextSwitchSampleCount() const
+{
+    uint64_t cnt = 0;
+    for( auto& v : m_data.threads )
+    {
+        cnt += v->ctxSwitchSamples.size();
     }
     return cnt;
 }
@@ -2262,6 +2392,12 @@ size_t Worker::GetFullFrameCount( const FrameData& fd ) const
     }
 }
 
+bool Worker::AreFramesUsed() const
+{
+    if( m_data.frames.Data().size() > 1 ) return true;
+    return m_data.framesBase->frames.size() > 2;
+}
+
 int64_t Worker::GetFrameTime( const FrameData& fd, size_t idx ) const
 {
     if( fd.continuous )
@@ -2381,7 +2517,7 @@ const Vector<SampleDataRange>* Worker::GetSamplesForSymbol( uint64_t symAddr ) c
     return &it->second;
 }
 
-const Vector<Int48>* Worker::GetChildSamples( uint64_t addr ) const
+const Vector<ChildSample>* Worker::GetChildSamples( uint64_t addr ) const
 {
     assert( m_data.symbolSamplesReady );
     auto it = m_data.childSamples.find( addr );
@@ -2416,15 +2552,17 @@ const char* Worker::GetSymbolCode( uint64_t sym, uint32_t& len ) const
     return it->second.data;
 }
 
-uint64_t Worker::GetSymbolForAddress( uint64_t address ) const
+uint64_t Worker::GetSymbolForAddress( uint64_t address )
 {
+    DoPostponedSymbols();
     auto it = std::lower_bound( m_data.symbolLoc.begin(), m_data.symbolLoc.end(), address, [] ( const auto& l, const auto& r ) { return l.addr + l.len < r; } );
     if( it == m_data.symbolLoc.end() || address < it->addr ) return 0;
     return it->addr;
 }
 
-uint64_t Worker::GetSymbolForAddress( uint64_t address, uint32_t& offset ) const
+uint64_t Worker::GetSymbolForAddress( uint64_t address, uint32_t& offset )
 {
+    DoPostponedSymbols();
     auto it = std::lower_bound( m_data.symbolLoc.begin(), m_data.symbolLoc.end(), address, [] ( const auto& l, const auto& r ) { return l.addr + l.len < r; } );
     if( it == m_data.symbolLoc.end() || address < it->addr ) return 0;
     offset = address - it->addr;
@@ -2440,34 +2578,23 @@ uint64_t Worker::GetInlineSymbolForAddress( uint64_t address ) const
 
 StringIdx Worker::GetLocationForAddress( uint64_t address, uint32_t& line ) const
 {
-    auto it = m_data.codeAddressToLocation.find( address );
-    if( it == m_data.codeAddressToLocation.end() )
+    auto frame = GetCallstackFrame( PackPointer( address ) );
+    if( !frame )
     {
         line = 0;
         return StringIdx();
     }
     else
     {
-        const auto idx = UnpackFileLine( it->second, line );
-        return StringIdx( idx );
+        auto subFrame = frame->data[0];
+        line = subFrame.line;
+        return subFrame.file;
     }
 }
 
-const Vector<uint64_t>* Worker::GetAddressesForLocation( uint32_t fileStringIdx, uint32_t line ) const
+const uint64_t* Worker::GetInlineSymbolList( uint64_t sym, uint32_t len )
 {
-    auto it = m_data.locationCodeAddressList.find( PackFileLine( fileStringIdx, line ) );
-    if( it == m_data.locationCodeAddressList.end() )
-    {
-        return nullptr;
-    }
-    else
-    {
-        return &it->second;
-    }
-}
-
-const uint64_t* Worker::GetInlineSymbolList( uint64_t sym, uint32_t len ) const
-{
+    DoPostponedInlineSymbols();
     auto it = std::lower_bound( m_data.symbolLocInline.begin(), m_data.symbolLocInline.end(), sym );
     if( it == m_data.symbolLocInline.end() ) return nullptr;
     if( *it >= sym + len ) return nullptr;
@@ -2618,6 +2745,12 @@ bool Worker::IsThreadLocal( uint64_t id )
     return td && ( td->count > 0 || !td->samples.empty() );
 }
 
+bool Worker::IsThreadFiber( uint64_t id )
+{
+    auto td = RetrieveThread( id );
+    return td && ( td->isFiber );
+}
+
 const SourceLocation& Worker::GetSourceLocation( int16_t srcloc ) const
 {
     if( srcloc < 0 )
@@ -2766,6 +2899,14 @@ std::vector<int16_t> Worker::GetMatchingSourceLocation( const char* query, bool 
 }
 
 #ifndef TRACY_NO_STATISTICS
+Worker::SourceLocationZones& Worker::GetZonesForSourceLocation( int16_t srcloc )
+{
+    assert( AreSourceLocationZonesReady() );
+    static SourceLocationZones empty;
+    auto it = m_data.sourceLocationZones.find( srcloc );
+    return it != m_data.sourceLocationZones.end() ? it->second : empty;
+}
+
 const Worker::SourceLocationZones& Worker::GetZonesForSourceLocation( int16_t srcloc ) const
 {
     assert( AreSourceLocationZonesReady() );
@@ -2898,12 +3039,12 @@ void Worker::Exec()
         }
         m_timerMul = welcome.timerMul;
         m_data.baseTime = welcome.initBegin;
-        const auto initEnd = TscTime( welcome.initEnd - m_data.baseTime );
+        const auto initEnd = TscTime( welcome.initEnd );
         m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
         m_data.framesBase->frames.push_back( FrameEvent{ initEnd, -1, -1 } );
         m_data.lastTime = initEnd;
-        m_delay = TscTime( welcome.delay );
-        m_resolution = TscTime( welcome.resolution );
+        m_delay = TscPeriod( welcome.delay );
+        m_resolution = TscPeriod( welcome.resolution );
         m_pid = welcome.pid;
         m_samplingPeriod = welcome.samplingPeriod;
         m_onDemand = welcome.flags & WelcomeFlag::OnDemand;
@@ -2914,6 +3055,7 @@ void Worker::Exec()
         m_data.cpuArch = (CpuArchitecture)welcome.cpuArch;
         m_codeTransfer = welcome.flags & WelcomeFlag::CodeTransfer;
         m_combineSamples = welcome.flags & WelcomeFlag::CombineSamples;
+        m_identifySamples = welcome.flags & WelcomeFlag::IdentifySamples;
         m_data.cpuId = welcome.cpuId;
         memcpy( m_data.cpuManufacturer, welcome.cpuManufacturer, 12 );
         m_data.cpuManufacturer[12] = '\0';
@@ -2937,11 +3079,11 @@ void Worker::Exec()
                 goto close;
             }
             m_data.frameOffset = onDemand.frames;
-            m_data.framesBase->frames.push_back( FrameEvent{ TscTime( onDemand.currentTime - m_data.baseTime ), -1, -1 } );
+            m_data.framesBase->frames.push_back( FrameEvent{ TscTime( onDemand.currentTime ), -1, -1 } );
         }
     }
 
-    m_serverQuerySpaceBase = m_serverQuerySpaceLeft = ( m_sock.GetSendBufSize() / ServerQueryPacketSize ) - ServerQueryPacketSize;   // leave space for terminate request
+    m_serverQuerySpaceBase = m_serverQuerySpaceLeft = std::min( ( m_sock.GetSendBufSize() / ServerQueryPacketSize ), 8*1024 ) - 4;   // leave space for terminate request
     m_hasData.store( true, std::memory_order_release );
 
     LZ4_setStreamDecode( (LZ4_streamDecode_t*)m_stream, nullptr, 0 );
@@ -2993,7 +3135,21 @@ void Worker::Exec()
                 m_netWriteCv.notify_one();
             }
 
-            if( !m_serverQueryQueue.empty() && m_serverQuerySpaceLeft > 0 )
+            if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueuePrio.empty() )
+            {
+                const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueuePrio.size() );
+                m_sock.Send( m_serverQueryQueuePrio.data(), toSend * ServerQueryPacketSize );
+                m_serverQuerySpaceLeft -= toSend;
+                if( toSend == m_serverQueryQueuePrio.size() )
+                {
+                    m_serverQueryQueuePrio.clear();
+                }
+                else
+                {
+                    m_serverQueryQueuePrio.erase( m_serverQueryQueuePrio.begin(), m_serverQueryQueuePrio.begin() + toSend );
+                }
+            }
+            if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueue.empty() )
             {
                 const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueue.size() );
                 m_sock.Send( m_serverQueryQueue.data(), toSend * ServerQueryPacketSize );
@@ -3023,9 +3179,9 @@ void Worker::Exec()
             if( m_pendingStrings != 0 || m_pendingThreads != 0 || m_pendingSourceLocation != 0 || m_pendingCallstackFrames != 0 ||
                 m_data.plots.IsPending() || m_pendingCallstackId != 0 || m_pendingExternalNames != 0 ||
                 m_pendingCallstackSubframes != 0 || m_pendingFrameImageData.image != nullptr || !m_pendingSymbols.empty() ||
-                !m_pendingSymbolCode.empty() || m_pendingCodeInformation != 0 || !m_serverQueryQueue.empty() ||
+                m_pendingSymbolCode != 0 || !m_serverQueryQueue.empty() || !m_serverQueryQueuePrio.empty() ||
                 m_pendingSourceLocationPayload != 0 || m_pendingSingleString.ptr != nullptr || m_pendingSecondString.ptr != nullptr ||
-                !m_sourceCodeQuery.empty() )
+                !m_sourceCodeQuery.empty() || m_pendingFibers != 0 )
             {
                 continue;
             }
@@ -3066,7 +3222,7 @@ void Worker::UpdateMbps( int64_t td )
         m_mbpsData.mbps.emplace_back( bytes / ( td * 125.f ) );
     }
     m_mbpsData.compRatio = decBytes == 0 ? 1 : float( bytes ) / decBytes;
-    m_mbpsData.queue = m_serverQueryQueue.size();
+    m_mbpsData.queue = m_serverQueryQueue.size() + m_serverQueryQueuePrio.size();
     m_mbpsData.transferred += bytes;
 }
 
@@ -3121,7 +3277,21 @@ void Worker::HandleFailure( const char* ptr, const char* end )
             m_netWriteCv.notify_one();
         }
 
-        if( !m_serverQueryQueue.empty() && m_serverQuerySpaceLeft > 0 )
+        if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueuePrio.empty() )
+        {
+            const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueuePrio.size() );
+            m_sock.Send( m_serverQueryQueuePrio.data(), toSend * ServerQueryPacketSize );
+            m_serverQuerySpaceLeft -= toSend;
+            if( toSend == m_serverQueryQueuePrio.size() )
+            {
+                m_serverQueryQueuePrio.clear();
+            }
+            else
+            {
+                m_serverQueryQueuePrio.erase( m_serverQueryQueuePrio.begin(), m_serverQueryQueuePrio.begin() + toSend );
+            }
+        }
+        if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueue.empty() )
         {
             const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueue.size() );
             m_sock.Send( m_serverQueryQueue.data(), toSend * ServerQueryPacketSize );
@@ -3184,6 +3354,10 @@ void Worker::DispatchFailure( const QueueItem& ev, const char*& ptr )
                 AddThreadString( ev.stringTransfer.ptr, ptr, sz );
                 m_serverQuerySpaceLeft++;
                 break;
+            case QueueType::FiberName:
+                AddFiberName( ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
             case QueueType::PlotName:
             case QueueType::FrameName:
             case QueueType::ExternalName:
@@ -3230,9 +3404,9 @@ void Worker::DispatchFailure( const QueueItem& ev, const char*& ptr )
                 ProcessCallstackFrame( ev.callstackFrame, false );
                 break;
             case QueueType::SymbolInformation:
-            case QueueType::CodeInformation:
             case QueueType::AckServerQueryNoop:
             case QueueType::AckSourceCodeNotAvailable:
+            case QueueType::AckSymbolCodeNotAvailable:
                 m_serverQuerySpaceLeft++;
                 break;
             default:
@@ -3245,10 +3419,14 @@ void Worker::DispatchFailure( const QueueItem& ev, const char*& ptr )
 void Worker::Query( ServerQuery type, uint64_t data, uint32_t extra )
 {
     ServerQueryPacket query { type, data, extra };
-    if( m_serverQueryQueue.empty() && m_serverQuerySpaceLeft > 0 )
+    if( m_serverQuerySpaceLeft > 0 && m_serverQueryQueuePrio.empty() && m_serverQueryQueue.empty() )
     {
         m_serverQuerySpaceLeft--;
         m_sock.Send( &query, ServerQueryPacketSize );
+    }
+    else if( IsQueryPrio( type ) )
+    {
+        m_serverQueryQueuePrio.push_back( query );
     }
     else
     {
@@ -3262,10 +3440,13 @@ void Worker::QueryTerminate()
     m_sock.Send( &query, ServerQueryPacketSize );
 }
 
-void Worker::QuerySourceFile( const char* fn )
+void Worker::QuerySourceFile( const char* fn, const char* image )
 {
+    if( image ) QueryDataTransfer( image, strlen( image ) + 1 );
     QueryDataTransfer( fn, strlen( fn ) + 1 );
-    Query( ServerQuerySourceCode, 0 );
+    m_sourceCodeQuery.emplace( m_nextSourceCodeQuery, fn );
+    Query( ServerQuerySourceCode, m_nextSourceCodeQuery );
+    m_nextSourceCodeQuery++;
 }
 
 void Worker::QueryDataTransfer( const void* ptr, size_t size )
@@ -3323,7 +3504,7 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
                 m_serverQuerySpaceLeft++;
                 break;
             case QueueType::SourceCode:
-                AddSourceCode( ptr, sz );
+                AddSourceCode( (uint32_t)ev.stringTransfer.ptr, ptr, sz );
                 m_serverQuerySpaceLeft++;
                 break;
             default:
@@ -3345,6 +3526,10 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
                 break;
             case QueueType::ThreadName:
                 AddThreadString( ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::FiberName:
+                AddFiberName( ev.stringTransfer.ptr, ptr, sz );
                 m_serverQuerySpaceLeft++;
                 break;
             case QueueType::PlotName:
@@ -3479,8 +3664,7 @@ void Worker::InsertMessageData( MessageData* msg )
         m_data.messages.insert( mit, msg );
     }
 
-    auto td = m_threadCtxData;
-    if( !td ) td = m_threadCtxData = NoticeThread( m_threadCtx );
+    auto td = GetCurrentThreadData();
     auto vec = &td->messages;
     if( vec->empty() )
     {
@@ -3508,7 +3692,8 @@ ThreadData* Worker::NoticeThreadReal( uint64_t thread )
     }
     else
     {
-        return NewThread( thread );
+        CheckThreadString( thread );
+        return NewThread( thread, false );
     }
 }
 
@@ -3527,6 +3712,14 @@ ThreadData* Worker::RetrieveThreadReal( uint64_t thread )
     }
 }
 
+ThreadData* Worker::GetCurrentThreadData()
+{
+    auto td = m_threadCtxData;
+    if( !td ) td = m_threadCtxData = NoticeThread( m_threadCtx );
+    if( td->fiber ) td = td->fiber;
+    return td;
+}
+
 #ifndef TRACY_NO_STATISTICS
 Worker::SourceLocationZones* Worker::GetSourceLocationZonesReal( uint16_t srcloc )
 {
@@ -3536,6 +3729,18 @@ Worker::SourceLocationZones* Worker::GetSourceLocationZonesReal( uint16_t srcloc
     m_data.srclocZonesLast.second = &it->second;
     return &it->second;
 }
+
+Worker::GpuSourceLocationZones* Worker::GetGpuSourceLocationZonesReal( uint16_t srcloc )
+{
+    auto it = m_data.gpuSourceLocationZones.find( srcloc );
+    if( it == m_data.gpuSourceLocationZones.end() )
+    {
+        it = m_data.gpuSourceLocationZones.emplace( srcloc, GpuSourceLocationZones() ).first;
+    }
+    m_data.gpuZonesLast.first = srcloc;
+    m_data.gpuZonesLast.second = &it->second;
+    return &it->second;
+}
 #else
 uint64_t* Worker::GetSourceLocationZonesCntReal( uint16_t srcloc )
 {
@@ -3543,6 +3748,15 @@ uint64_t* Worker::GetSourceLocationZonesCntReal( uint16_t srcloc )
     assert( it != m_data.sourceLocationZonesCnt.end() );
     m_data.srclocCntLast.first = srcloc;
     m_data.srclocCntLast.second = &it->second;
+    return &it->second;
+}
+
+uint64_t* Worker::GetGpuSourceLocationZonesCntReal( uint16_t srcloc )
+{
+    auto it = m_data.gpuSourceLocationZonesCnt.find( srcloc );
+    assert( it != m_data.gpuSourceLocationZonesCnt.end() );
+    m_data.gpuCntLast.first = srcloc;
+    m_data.gpuCntLast.second = &it->second;
     return &it->second;
 }
 #endif
@@ -3561,9 +3775,8 @@ const MemData& Worker::GetMemoryNamed( uint64_t name ) const
     return *it->second;
 }
 
-ThreadData* Worker::NewThread( uint64_t thread )
+ThreadData* Worker::NewThread( uint64_t thread, bool fiber )
 {
-    CheckThreadString( thread );
     auto td = m_slab.AllocInit<ThreadData>();
     td->id = thread;
     td->count = 0;
@@ -3573,6 +3786,10 @@ ThreadData* Worker::NewThread( uint64_t thread )
 #endif
     td->kernelSampleCnt = 0;
     td->pendingSample.time.Clear();
+    td->isFiber = fiber;
+    td->fiber = nullptr;
+    td->stackCount = (uint8_t*)m_slab.AllocBig( sizeof( uint8_t ) * 64*1024 );
+    memset( td->stackCount, 0, sizeof( uint8_t ) * 64*1024 );
     m_data.threads.push_back( td );
     m_threadMap.emplace( thread, td );
     m_data.threadDataLast.first = thread;
@@ -3580,12 +3797,11 @@ ThreadData* Worker::NewThread( uint64_t thread )
     return td;
 }
 
-void Worker::NewZone( ZoneEvent* zone, uint64_t thread )
+void Worker::NewZone( ZoneEvent* zone )
 {
     m_data.zonesCnt++;
 
-    auto td = m_threadCtxData;
-    if( !td ) td = m_threadCtxData = NoticeThread( thread );
+    auto td = GetCurrentThreadData();
     td->count++;
     td->IncStackCount( zone->SrcLoc() );
     const auto ssz = td->stack.size();
@@ -3685,6 +3901,16 @@ void Worker::CheckThreadString( uint64_t id )
     if( m_sock.IsValid() ) Query( ServerQueryThreadString, id );
 }
 
+void Worker::CheckFiberName( uint64_t id, uint64_t tid )
+{
+    if( m_data.threadNames.find( tid ) != m_data.threadNames.end() ) return;
+
+    m_data.threadNames.emplace( tid, "???" );
+    m_pendingFibers++;
+
+    if( m_sock.IsValid() ) Query( ServerQueryFiberName, id );
+}
+
 void Worker::CheckExternalName( uint64_t id )
 {
     if( m_data.externalNames.find( id ) != m_data.externalNames.end() ) return;
@@ -3725,7 +3951,7 @@ void Worker::AddSourceLocation( const QueueSourceLocation& srcloc )
     }
     CheckString( srcloc.function );
     const uint32_t color = ( srcloc.r << 16 ) | ( srcloc.g << 8 ) | srcloc.b;
-    it->second = SourceLocation { srcloc.name == 0 ? StringRef() : StringRef( StringRef::Ptr, srcloc.name ), StringRef( StringRef::Ptr, srcloc.function ), StringRef( StringRef::Ptr, srcloc.file ), srcloc.line, color };
+    it->second = SourceLocation {{ srcloc.name == 0 ? StringRef() : StringRef( StringRef::Ptr, srcloc.name ), StringRef( StringRef::Ptr, srcloc.function ), StringRef( StringRef::Ptr, srcloc.file ), srcloc.line, color }};
 }
 
 void Worker::AddSourceLocationPayload( uint64_t ptr, const char* data, size_t sz )
@@ -3755,7 +3981,7 @@ void Worker::AddSourceLocationPayload( uint64_t ptr, const char* data, size_t sz
             ( ( color & 0x0000FF00 )       ) |
             ( ( color & 0x000000FF ) << 16 );
 
-    SourceLocation srcloc { nsz == 0 ? StringRef() : StringRef( StringRef::Idx, StoreString( end, nsz ).idx ), StringRef( StringRef::Idx, func.idx ), StringRef( StringRef::Idx, source.idx ), line, color };
+    SourceLocation srcloc {{ nsz == 0 ? StringRef() : StringRef( StringRef::Idx, StoreString( end, nsz ).idx ), StringRef( StringRef::Idx, func.idx ), StringRef( StringRef::Idx, source.idx ), line, color }};
     auto it = m_data.sourceLocationPayloadMap.find( &srcloc );
     if( it == m_data.sourceLocationPayloadMap.end() )
     {
@@ -3765,12 +3991,15 @@ void Worker::AddSourceLocationPayload( uint64_t ptr, const char* data, size_t sz
         m_data.sourceLocationPayloadMap.emplace( slptr, idx );
         m_pendingSourceLocationPayload = -int16_t( idx + 1 );
         m_data.sourceLocationPayload.push_back( slptr );
+        if( m_checkedFileStrings.find( srcloc.file ) == m_checkedFileStrings.end() )
+        {
+            CacheSource( srcloc.file );
+        }
         const auto key = -int16_t( idx + 1 );
 #ifndef TRACY_NO_STATISTICS
         auto res = m_data.sourceLocationZones.emplace( key, SourceLocationZones() );
         m_data.srclocZonesLast.first = key;
         m_data.srclocZonesLast.second = &res.first->second;
-
 #else
         auto res = m_data.sourceLocationZonesCnt.emplace( key, 0 );
         m_data.srclocCntLast.first = key;
@@ -3809,6 +4038,18 @@ void Worker::AddThreadString( uint64_t id, const char* str, size_t sz )
     assert( it != m_data.threadNames.end() && strcmp( it->second, "???" ) == 0 );
     const auto sl = StoreString( str, sz );
     it->second = sl.ptr;
+}
+
+void Worker::AddFiberName( uint64_t id, const char* str, size_t sz )
+{
+    assert( m_pendingFibers > 0 );
+    m_pendingFibers--;
+    auto it = m_data.fiberToThreadMap.find( id );
+    assert( it != m_data.fiberToThreadMap.end() );
+    auto tit = m_data.threadNames.find( it->second );
+    assert( tit != m_data.threadNames.end() && strcmp( tit->second, "???" ) == 0 );
+    const auto sl = StoreString( str, sz );
+    tit->second = sl.ptr;
 }
 
 void Worker::AddSingleString( const char* str, size_t sz )
@@ -3871,9 +4112,8 @@ void Worker::AddFrameImageData( uint64_t ptr, const char* data, size_t sz )
 
 void Worker::AddSymbolCode( uint64_t ptr, const char* data, size_t sz )
 {
-    auto it = m_pendingSymbolCode.find( ptr );
-    assert( it != m_pendingSymbolCode.end() );
-    m_pendingSymbolCode.erase( it );
+    assert( m_pendingSymbolCode > 0 );
+    m_pendingSymbolCode--;
 
     auto code = (char*)m_slab.AllocBig( sz );
     memcpy( code, data, sz );
@@ -3906,10 +4146,15 @@ void Worker::AddSymbolCode( uint64_t ptr, const char* data, size_t sz )
     size_t cnt = cs_disasm( handle, (const uint8_t*)code, sz, ptr, 0, &insn );
     if( cnt > 0 )
     {
-        m_pendingCodeInformation += cnt;
         for( size_t i=0; i<cnt; i++ )
         {
-            Query( ServerQueryCodeLocation, insn[i].address );
+            const auto addr = insn[i].address;
+            const auto ptr = PackPointer( addr );
+            if( m_data.callstackFrameMap.find( ptr ) == m_data.callstackFrameMap.end() )
+            {
+                m_pendingCallstackFrames++;
+                Query( ServerQueryCallstackFrame, addr );
+            }
         }
         cs_free( insn, cnt );
     }
@@ -3917,11 +4162,12 @@ void Worker::AddSymbolCode( uint64_t ptr, const char* data, size_t sz )
 }
 
 
-void Worker::AddSourceCode( const char* data, size_t sz )
+void Worker::AddSourceCode( uint32_t id, const char* data, size_t sz )
 {
-    assert( !m_sourceCodeQuery.empty() );
-    auto file = m_sourceCodeQuery.front();
-    m_sourceCodeQuery.erase( m_sourceCodeQuery.begin() );
+    auto it = m_sourceCodeQuery.find( id );
+    assert( it != m_sourceCodeQuery.end() );
+    auto file = it->second;
+    m_sourceCodeQuery.erase( it );
     if( m_data.sourceFileCache.find( file ) != m_data.sourceFileCache.end() ) return;
     auto src = (char*)m_slab.AllocBig( sz );
     memcpy( src, data, sz );
@@ -4083,18 +4329,53 @@ void Worker::AddCallstackAllocPayload( uint64_t ptr, const char* data, size_t _s
     m_pendingCallstackId = idx;
 }
 
+uint32_t Worker::MergeCallstacks( uint32_t first, uint32_t second )
+{
+    const auto& cs1 = GetCallstack( first );
+    const auto& cs2 = GetCallstack( second );
+
+    const auto sz1 = cs1.size();
+    const auto sz2 = cs2.size();
+    const auto tsz = sz1 + sz2;
+
+    size_t memsize = sizeof( VarArray<CallstackFrameId> ) + tsz * sizeof( CallstackFrameId );
+    auto mem = (char*)m_slab.AllocRaw( memsize );
+    memcpy( mem, cs1.data(), sizeof( CallstackFrameId ) * sz1 );
+    memcpy( mem + sizeof( CallstackFrameId ) * sz1, cs2.data(), sizeof( CallstackFrameId ) * sz2 );
+
+    VarArray<CallstackFrameId>* arr = (VarArray<CallstackFrameId>*)( mem + tsz * sizeof( CallstackFrameId ) );
+    new(arr) VarArray<CallstackFrameId>( tsz, (CallstackFrameId*)mem );
+
+    uint32_t idx;
+    auto it = m_data.callstackMap.find( arr );
+    if( it == m_data.callstackMap.end() )
+    {
+        idx = m_data.callstackPayload.size();
+        m_data.callstackMap.emplace( arr, idx );
+        m_data.callstackPayload.push_back( arr );
+    }
+    else
+    {
+        idx = it->second;
+        m_slab.Unalloc( memsize );
+    }
+    return idx;
+}
+
 void Worker::InsertPlot( PlotData* plot, int64_t time, double val )
 {
     if( plot->data.empty() )
     {
         plot->min = val;
         plot->max = val;
+        plot->sum = val;
         plot->data.push_back( { Int48( time ), val } );
     }
     else
     {
         if( plot->min > val ) plot->min = val;
         else if( plot->max < val ) plot->max = val;
+        plot->sum += val;
         plot->data.push_back( { Int48( time ), val } );
     }
 }
@@ -4120,30 +4401,8 @@ void Worker::HandleFrameName( uint64_t name, const char* str, size_t sz )
     } );
 }
 
-void Worker::DoPostponedWork()
+void Worker::DoPostponedSymbols()
 {
-    for( auto& plot : m_data.plots.Data() )
-    {
-        if( !plot->data.is_sorted() ) plot->data.sort();
-    }
-
-#ifndef TRACY_NO_STATISTICS
-    if( m_data.newFramesWereReceived )
-    {
-        HandlePostponedSamples();
-        HandlePostponedGhostZones();
-        m_data.newFramesWereReceived = false;
-    }
-
-    if( m_data.sourceLocationZonesReady )
-    {
-        for( auto& slz : m_data.sourceLocationZones )
-        {
-            if( !slz.second.zones.is_sorted() ) slz.second.zones.sort();
-        }
-    }
-#endif
-
     if( m_data.newSymbolsIndex >= 0 )
     {
 #ifdef NO_PARALLEL_SORT
@@ -4155,6 +4414,10 @@ void Worker::DoPostponedWork()
         std::inplace_merge( ms, m_data.symbolLoc.begin() + m_data.newSymbolsIndex, m_data.symbolLoc.end(), [] ( const auto& l, const auto& r ) { return l.addr < r.addr; } );
         m_data.newSymbolsIndex = -1;
     }
+}
+
+void Worker::DoPostponedInlineSymbols()
+{
     if( m_data.newInlineSymbolsIndex >= 0 )
     {
 #ifdef NO_PARALLEL_SORT
@@ -4166,6 +4429,73 @@ void Worker::DoPostponedWork()
         std::inplace_merge( ms, m_data.symbolLocInline.begin() + m_data.newInlineSymbolsIndex, m_data.symbolLocInline.end() );
         m_data.newInlineSymbolsIndex = -1;
     }
+}
+
+void Worker::DoPostponedWorkAll()
+{
+    DoPostponedWork();
+    DoPostponedSymbols();
+    DoPostponedInlineSymbols();
+
+    for( auto& plot : m_data.plots.Data() )
+    {
+        if( !plot->data.is_sorted() ) plot->data.sort();
+    }
+}
+
+void Worker::DoPostponedWork()
+{
+#ifndef TRACY_NO_STATISTICS
+    if( m_data.newFramesWereReceived )
+    {
+        HandlePostponedSamples();
+        HandlePostponedGhostZones();
+        m_data.newFramesWereReceived = false;
+    }
+
+    if( m_identifySamples && m_data.newContextSwitchesReceived )
+    {
+        for( auto& td : m_data.threads )
+        {
+            if( !td->postponedSamples.empty() )
+            {
+                auto ctx = GetContextSwitchData( td->id );
+                if( ctx )
+                {
+                    td->postponedSamples.ensure_sorted();
+                    auto sit = td->postponedSamples.begin();
+                    auto cit = std::lower_bound( ctx->v.begin(), ctx->v.end(), sit->time.Val(), [] ( const auto& l, const auto& r ) { return (uint64_t)l.End() < (uint64_t)r; } );
+                    if( cit != ctx->v.end() )
+                    {
+                        do
+                        {
+                            if( sit->time.Val() == cit->Start() )
+                            {
+                                td->ctxSwitchSamples.push_back( *sit );
+                            }
+                            else
+                            {
+                                ProcessCallstackSampleImplStats( *sit, *td );
+                            }
+                            if( ++sit == td->postponedSamples.end() ) break;
+                            cit = std::lower_bound( cit, ctx->v.end(), sit->time.Val(), [] ( const auto& l, const auto& r ) { return (uint64_t)l.End() < (uint64_t)r; } );
+                        }
+                        while( cit != ctx->v.end() );
+                        if( sit == td->postponedSamples.end() )
+                        {
+                            td->postponedSamples.clear();
+                        }
+                        else
+                        {
+                            td->postponedSamples.erase( td->postponedSamples.begin(), sit );
+                        }
+                    }
+                }
+            }
+        }
+        m_data.newContextSwitchesReceived = false;
+    }
+#endif
 }
 
 #ifndef TRACY_NO_STATISTICS
@@ -4384,6 +4714,9 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::FrameMarkMsgEnd:
         ProcessFrameMarkEnd( ev.frameMark );
         break;
+    case QueueType::FrameVsync:
+        ProcessFrameVsync( ev.frameVsync );
+        break;
     case QueueType::FrameImage:
         ProcessFrameImage( ev.frameImage );
         break;
@@ -4425,7 +4758,7 @@ bool Worker::Process( const QueueItem& ev )
         ProcessLockSharedObtain( ev.lockObtain );
         break;
     case QueueType::LockSharedRelease:
-        ProcessLockSharedRelease( ev.lockRelease );
+        ProcessLockSharedRelease( ev.lockReleaseShared );
         break;
     case QueueType::LockMark:
         ProcessLockMark( ev.lockMark );
@@ -4433,8 +4766,14 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::LockName:
         ProcessLockName( ev.lockName );
         break;
-    case QueueType::PlotData:
-        ProcessPlotData( ev.plotData );
+    case QueueType::PlotDataInt:
+        ProcessPlotDataInt( ev.plotDataInt );
+        break;
+    case QueueType::PlotDataFloat:
+        ProcessPlotDataFloat( ev.plotDataFloat );
+        break;
+    case QueueType::PlotDataDouble:
+        ProcessPlotDataDouble( ev.plotDataDouble );
         break;
     case QueueType::PlotConfig:
         ProcessPlotConfig( ev.plotConfig );
@@ -4542,6 +4881,9 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::CallstackSample:
         ProcessCallstackSample( ev.callstackSample );
         break;
+    case QueueType::CallstackSampleContextSwitch:
+        ProcessCallstackSampleContextSwitch( ev.callstackSample );
+        break;
     case QueueType::CallstackFrameSize:
         ProcessCallstackFrameSize( ev.callstackFrameSize );
         m_serverQuerySpaceLeft++;
@@ -4551,10 +4893,6 @@ bool Worker::Process( const QueueItem& ev )
         break;
     case QueueType::SymbolInformation:
         ProcessSymbolInformation( ev.symbolInformation );
-        m_serverQuerySpaceLeft++;
-        break;
-    case QueueType::CodeInformation:
-        ProcessCodeInformation( ev.codeInformation );
         m_serverQuerySpaceLeft++;
         break;
     case QueueType::Terminate:
@@ -4605,8 +4943,11 @@ bool Worker::Process( const QueueItem& ev )
         m_serverQuerySpaceLeft++;
         break;
     case QueueType::AckSourceCodeNotAvailable:
-        assert( !m_sourceCodeQuery.empty() );
-        m_sourceCodeQuery.erase( m_sourceCodeQuery.begin() );
+        ProcessSourceCodeNotAvailable( ev.sourceCodeNotAvailable );
+        m_serverQuerySpaceLeft++;
+        break;
+    case QueueType::AckSymbolCodeNotAvailable:
+        m_pendingSymbolCode--;
         m_serverQuerySpaceLeft++;
         break;
     case QueueType::CpuTopology:
@@ -4614,6 +4955,12 @@ bool Worker::Process( const QueueItem& ev )
         break;
     case QueueType::MemNamePayload:
         ProcessMemNamePayload( ev.memName );
+        break;
+    case QueueType::FiberEnter:
+        ProcessFiberEnter( ev.fiberEnter );
+        break;
+    case QueueType::FiberLeave:
+        ProcessFiberLeave( ev.fiberLeave );
         break;
     default:
         assert( false );
@@ -4633,36 +4980,39 @@ void Worker::ProcessThreadContext( const QueueThreadContext& ev )
     }
 }
 
+static tracy_force_inline int64_t RefTime( int64_t& reference, int64_t delta )
+{
+    const auto refTime = reference + delta;
+    reference = refTime;
+    return refTime;
+}
+
 void Worker::ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev )
 {
     CheckSourceLocation( ev.srcloc );
 
-    const auto refTime = m_refTimeThread + ev.time;
-    m_refTimeThread = refTime;
-    const auto start = TscTime( refTime - m_data.baseTime );
+    const auto start = TscTime( RefTime( m_refTimeThread, ev.time ) );
     zone->SetStartSrcLoc( start, ShrinkSourceLocation( ev.srcloc ) );
     zone->SetEnd( -1 );
     zone->SetChild( -1 );
 
     if( m_data.lastTime < start ) m_data.lastTime = start;
 
-    NewZone( zone, m_threadCtx );
+    NewZone( zone );
 }
 
 void Worker::ProcessZoneBeginAllocSrcLocImpl( ZoneEvent* zone, const QueueZoneBeginLean& ev )
 {
     assert( m_pendingSourceLocationPayload != 0 );
 
-    const auto refTime = m_refTimeThread + ev.time;
-    m_refTimeThread = refTime;
-    const auto start = TscTime( refTime - m_data.baseTime );
+    const auto start = TscTime( RefTime( m_refTimeThread, ev.time ) );
     zone->SetStartSrcLoc( start, m_pendingSourceLocationPayload );
     zone->SetEnd( -1 );
     zone->SetChild( -1 );
 
     if( m_data.lastTime < start ) m_data.lastTime = start;
 
-    NewZone( zone, m_threadCtx );
+    NewZone( zone );
 
     m_pendingSourceLocationPayload = 0;
 }
@@ -4696,7 +5046,8 @@ void Worker::ProcessZoneBeginCallstack( const QueueZoneBegin& ev )
 {
     auto zone = AllocZoneEvent();
     ProcessZoneBeginImpl( zone, ev );
-    auto it = m_nextCallstack.find( m_threadCtx );
+    auto td = GetCurrentThreadData();
+    auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
     auto& extra = RequestZoneExtra( *zone );
     extra.callstack.SetVal( it->second );
@@ -4713,7 +5064,8 @@ void Worker::ProcessZoneBeginAllocSrcLocCallstack( const QueueZoneBeginLean& ev 
 {
     auto zone = AllocZoneEvent();
     ProcessZoneBeginAllocSrcLocImpl( zone, ev );
-    auto it = m_nextCallstack.find( m_threadCtx );
+    auto td = GetCurrentThreadData();
+    auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
     auto& extra = RequestZoneExtra( *zone );
     extra.callstack.SetVal( it->second );
@@ -4722,18 +5074,16 @@ void Worker::ProcessZoneBeginAllocSrcLocCallstack( const QueueZoneBeginLean& ev 
 
 void Worker::ProcessZoneEnd( const QueueZoneEnd& ev )
 {
-    auto td = m_threadCtxData;
-    assert( td );
-
+    auto td = GetCurrentThreadData();
     if( td->zoneIdStack.empty() )
     {
-        ZoneDoubleEndFailure( m_threadCtx, td->timeline.empty() ? nullptr : td->timeline.back() );
+        ZoneDoubleEndFailure( td->id, td->timeline.empty() ? nullptr : td->timeline.back() );
         return;
     }
     auto zoneId = td->zoneIdStack.back_and_pop();
     if( zoneId != td->nextZoneId )
     {
-        ZoneStackFailure( m_threadCtx, td->stack.back() );
+        ZoneStackFailure( td->id, td->stack.back() );
         return;
     }
     td->nextZoneId = 0;
@@ -4743,9 +5093,7 @@ void Worker::ProcessZoneEnd( const QueueZoneEnd& ev )
     auto zone = stack.back_and_pop();
     assert( zone->End() == -1 );
     const auto isReentry = td->DecStackCount( zone->SrcLoc() );
-    const auto refTime = m_refTimeThread + ev.time;
-    m_refTimeThread = refTime;
-    const auto timeEnd = TscTime( refTime - m_data.baseTime );
+    const auto timeEnd = TscTime( RefTime( m_refTimeThread, ev.time ) );
     zone->SetEnd( timeEnd );
     assert( timeEnd >= zone->Start() );
 
@@ -4785,7 +5133,7 @@ void Worker::ProcessZoneEnd( const QueueZoneEnd& ev )
     {
         ZoneThreadData ztd;
         ztd.SetZone( zone );
-        ztd.SetThread( CompressThread( m_threadCtx ) );
+        ztd.SetThread( CompressThread( td->id ) );
         auto slz = GetSourceLocationZones( zone->SrcLoc() );
         slz->zones.push_back( ztd );
         if( slz->min > timeSpan ) slz->min = timeSpan;
@@ -4831,10 +5179,28 @@ void Worker::ZoneDoubleEndFailure( uint64_t thread, const ZoneEvent* ev )
     m_failureData.srcloc = ev ? ev->SrcLoc() : 0;
 }
 
-void Worker::ZoneTextFailure( uint64_t thread )
+void Worker::ZoneTextFailure( uint64_t thread, const char* text )
 {
     m_failure = Failure::ZoneText;
     m_failureData.thread = thread;
+    m_failureData.message = text;
+}
+
+void Worker::ZoneValueFailure( uint64_t thread, uint64_t value )
+{
+    char buf[128];
+    if( (int64_t)value < 0 )
+    {
+        sprintf( buf, "Zone value was: %" PRIu64 " (unsigned), %" PRIi64 " (signed)", value, (int64_t)value );
+    }
+    else
+    {
+        sprintf( buf, "Zone value was: %" PRIu64, value );
+    }
+
+    m_failure = Failure::ZoneValue;
+    m_failureData.thread = thread;
+    m_failureData.message = buf;
 }
 
 void Worker::ZoneColorFailure( uint64_t thread )
@@ -4878,10 +5244,14 @@ void Worker::FrameImageTwiceFailure()
     m_failure = Failure::FrameImageTwice;
 }
 
+void Worker::FiberLeaveFailure()
+{
+    m_failure = Failure::FiberLeave;
+}
+
 void Worker::ProcessZoneValidation( const QueueZoneValidation& ev )
 {
-    auto td = m_threadCtxData;
-    if( !td ) td = m_threadCtxData = NoticeThread( m_threadCtx );
+    auto td = GetCurrentThreadData();
     td->nextZoneId = ev.id;
 }
 
@@ -4908,7 +5278,7 @@ void Worker::ProcessFrameMark( const QueueFrameMark& ev )
     }
 
     assert( fd->continuous == 1 );
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     assert( fd->frames.empty() || fd->frames.back().start <= time );
     fd->frames.push_back( FrameEvent{ time, -1, frameImage } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -4937,7 +5307,7 @@ void Worker::ProcessFrameMarkStart( const QueueFrameMark& ev )
     } );
 
     assert( fd->continuous == 0 );
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     assert( fd->frames.empty() || ( fd->frames.back().end <= time && fd->frames.back().end != -1 ) );
     fd->frames.push_back( FrameEvent{ time, -1, -1 } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -4955,7 +5325,7 @@ void Worker::ProcessFrameMarkEnd( const QueueFrameMark& ev )
     } );
 
     assert( fd->continuous == 0 );
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     if( fd->frames.empty() )
     {
         FrameEndFailure();
@@ -4963,6 +5333,38 @@ void Worker::ProcessFrameMarkEnd( const QueueFrameMark& ev )
     }
     assert( fd->frames.back().end == -1 );
     fd->frames.back().end = time;
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+
+#ifndef TRACY_NO_STATISTICS
+    const auto timeSpan = GetFrameTime( *fd, fd->frames.size() - 1 );
+    if( timeSpan > 0 )
+    {
+        fd->min = std::min( fd->min, timeSpan );
+        fd->max = std::max( fd->max, timeSpan );
+        fd->total += timeSpan;
+        fd->sumSq += double( timeSpan ) * timeSpan;
+    }
+#endif
+}
+
+void Worker::ProcessFrameVsync( const QueueFrameVsync& ev )
+{
+    auto it = m_vsyncFrameMap.find( ev.id );
+    if( it == m_vsyncFrameMap.end() )
+    {
+        auto fd = m_slab.AllocInit<FrameData>();
+        // Hackfix workaround to maintain backwards compatibility.
+        // Frame name pointers won't be in kernel space. Exploit that to store custom IDs.
+        fd->name = uint64_t( m_vsyncFrameMap.size() ) | 0x8000000000000000;
+        fd->continuous = 1;
+        m_data.frames.AddExternal( fd );
+        it = m_vsyncFrameMap.emplace( ev.id, fd ).first;
+    }
+    auto fd = it->second;
+    assert( fd->continuous == 1 );
+    const auto time = TscTime( ev.time );
+    assert( fd->frames.empty() || fd->frames.back().start <= time );
+    fd->frames.push_back( FrameEvent{ time, -1, -1 } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 
 #ifndef TRACY_NO_STATISTICS
@@ -5028,9 +5430,15 @@ void Worker::ProcessFrameImage( const QueueFrameImage& ev )
 void Worker::ProcessZoneText()
 {
     auto td = RetrieveThread( m_threadCtx );
-    if( !td || td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    if( !td )
     {
-        ZoneTextFailure( m_threadCtx );
+        ZoneTextFailure( m_threadCtx, m_pendingSingleString.ptr );
+        return;
+    }
+    if( td->fiber ) td = td->fiber;
+    if( td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    {
+        ZoneTextFailure( td->id, m_pendingSingleString.ptr );
         return;
     }
 
@@ -5069,9 +5477,15 @@ void Worker::ProcessZoneText()
 void Worker::ProcessZoneName()
 {
     auto td = RetrieveThread( m_threadCtx );
-    if( !td || td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    if( !td )
     {
         ZoneNameFailure( m_threadCtx );
+        return;
+    }
+    if( td->fiber ) td = td->fiber;
+    if( td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    {
+        ZoneNameFailure( td->id );
         return;
     }
 
@@ -5085,9 +5499,15 @@ void Worker::ProcessZoneName()
 void Worker::ProcessZoneColor( const QueueZoneColor& ev )
 {
     auto td = RetrieveThread( m_threadCtx );
-    if( !td || td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    if( !td )
     {
         ZoneColorFailure( m_threadCtx );
+        return;
+    }
+    if( td->fiber ) td = td->fiber;
+    if( td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    {
+        ZoneColorFailure( td->id );
         return;
     }
 
@@ -5105,9 +5525,15 @@ void Worker::ProcessZoneValue( const QueueZoneValue& ev )
     const auto tsz = sprintf( tmp, "%" PRIu64, ev.value );
 
     auto td = RetrieveThread( m_threadCtx );
-    if( !td || td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    if( !td )
     {
-        ZoneTextFailure( m_threadCtx );
+        ZoneValueFailure( m_threadCtx, ev.value );
+        return;
+    }
+    if( td->fiber ) td = td->fiber;
+    if( td->stack.empty() || td->nextZoneId != td->zoneIdStack.back() )
+    {
+        ZoneValueFailure( td->id, ev.value );
         return;
     }
 
@@ -5145,10 +5571,11 @@ void Worker::ProcessLockAnnounce( const QueueLockAnnounce& ev )
     auto lm = m_slab.AllocInit<LockMap>();
     lm->srcloc = ShrinkSourceLocation( ev.lckloc );
     lm->type = ev.type;
-    lm->timeAnnounce = TscTime( ev.time - m_data.baseTime );
+    lm->timeAnnounce = TscTime( ev.time );
     lm->timeTerminate = 0;
     lm->valid = true;
     lm->isContended = false;
+    lm->lockingThread = 0;
     m_data.lockMap.emplace( ev.id, lm );
     CheckSourceLocation( ev.lckloc );
 }
@@ -5157,7 +5584,7 @@ void Worker::ProcessLockTerminate( const QueueLockTerminate& ev )
 {
     auto it = m_data.lockMap.find( ev.id );
     assert( it != m_data.lockMap.end() );
-    it->second->timeTerminate = TscTime( ev.time - m_data.baseTime );
+    it->second->timeTerminate = TscTime( ev.time );
 }
 
 void Worker::ProcessLockWait( const QueueLockWait& ev )
@@ -5167,9 +5594,7 @@ void Worker::ProcessLockWait( const QueueLockWait& ev )
     auto& lock = *it->second;
 
     auto lev = lock.type == LockType::Lockable ? m_slab.Alloc<LockEvent>() : m_slab.Alloc<LockEventShared>();
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeSerial, ev.time ) );
     lev->SetTime( time );
     lev->SetSrcLoc( 0 );
     lev->type = LockEvent::Type::Wait;
@@ -5184,14 +5609,13 @@ void Worker::ProcessLockObtain( const QueueLockObtain& ev )
     auto& lock = *it->second;
 
     auto lev = lock.type == LockType::Lockable ? m_slab.Alloc<LockEvent>() : m_slab.Alloc<LockEventShared>();
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeSerial, ev.time ) );
     lev->SetTime( time );
     lev->SetSrcLoc( 0 );
     lev->type = LockEvent::Type::Obtain;
 
     InsertLockEvent( lock, lev, ev.thread, time );
+    lock.lockingThread = ev.thread;
 }
 
 void Worker::ProcessLockRelease( const QueueLockRelease& ev )
@@ -5201,14 +5625,12 @@ void Worker::ProcessLockRelease( const QueueLockRelease& ev )
     auto& lock = *it->second;
 
     auto lev = lock.type == LockType::Lockable ? m_slab.Alloc<LockEvent>() : m_slab.Alloc<LockEventShared>();
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeSerial, ev.time ) );
     lev->SetTime( time );
     lev->SetSrcLoc( 0 );
     lev->type = LockEvent::Type::Release;
 
-    InsertLockEvent( lock, lev, ev.thread, time );
+    InsertLockEvent( lock, lev, lock.lockingThread, time );
 }
 
 void Worker::ProcessLockSharedWait( const QueueLockWait& ev )
@@ -5219,9 +5641,7 @@ void Worker::ProcessLockSharedWait( const QueueLockWait& ev )
 
     assert( lock.type == LockType::SharedLockable );
     auto lev = m_slab.Alloc<LockEventShared>();
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeSerial, ev.time ) );
     lev->SetTime( time );
     lev->SetSrcLoc( 0 );
     lev->type = LockEvent::Type::WaitShared;
@@ -5237,9 +5657,7 @@ void Worker::ProcessLockSharedObtain( const QueueLockObtain& ev )
 
     assert( lock.type == LockType::SharedLockable );
     auto lev = m_slab.Alloc<LockEventShared>();
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeSerial, ev.time ) );
     lev->SetTime( time );
     lev->SetSrcLoc( 0 );
     lev->type = LockEvent::Type::ObtainShared;
@@ -5247,7 +5665,7 @@ void Worker::ProcessLockSharedObtain( const QueueLockObtain& ev )
     InsertLockEvent( lock, lev, ev.thread, time );
 }
 
-void Worker::ProcessLockSharedRelease( const QueueLockRelease& ev )
+void Worker::ProcessLockSharedRelease( const QueueLockReleaseShared& ev )
 {
     auto it = m_data.lockMap.find( ev.id );
     assert( it != m_data.lockMap.end() );
@@ -5255,9 +5673,7 @@ void Worker::ProcessLockSharedRelease( const QueueLockRelease& ev )
 
     assert( lock.type == LockType::SharedLockable );
     auto lev = m_slab.Alloc<LockEventShared>();
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeSerial, ev.time ) );
     lev->SetTime( time );
     lev->SetSrcLoc( 0 );
     lev->type = LockEvent::Type::ReleaseShared;
@@ -5302,49 +5718,41 @@ void Worker::ProcessLockName( const QueueLockName& ev )
     lit->second->customName = StringIdx( GetSingleStringIdx() );
 }
 
-void Worker::ProcessPlotData( const QueuePlotData& ev )
+void Worker::ProcessPlotDataInt( const QueuePlotDataInt& ev )
 {
-    switch( ev.type )
-    {
-    case PlotDataType::Double:
-        if( !isfinite( ev.data.d ) ) return;
-        break;
-    case PlotDataType::Float:
-        if( !isfinite( ev.data.f ) ) return;
-        break;
-    default:
-        break;
-    }
+    ProcessPlotDataImpl( ev.name, ev.time, (double)ev.val );
+}
 
-    PlotData* plot = m_data.plots.Retrieve( ev.name, [this] ( uint64_t name ) {
+void Worker::ProcessPlotDataFloat( const QueuePlotDataFloat& ev )
+{
+    if( !isfinite( ev.val ) ) return;
+    ProcessPlotDataImpl( ev.name, ev.time, (double)ev.val );
+}
+
+void Worker::ProcessPlotDataDouble( const QueuePlotDataDouble& ev )
+{
+    if( !isfinite( ev.val ) ) return;
+    ProcessPlotDataImpl( ev.name, ev.time, ev.val );
+}
+
+void Worker::ProcessPlotDataImpl( uint64_t name, int64_t evTime, double val )
+{
+    PlotData* plot = m_data.plots.Retrieve( name, [this] ( uint64_t name ) {
         auto plot = m_slab.AllocInit<PlotData>();
         plot->name = name;
         plot->type = PlotType::User;
         plot->format = PlotValueFormatting::Number;
+        plot->showSteps = false;
+        plot->fill = true;
+        plot->color = 0;
         return plot;
     }, [this]( uint64_t name ) {
         Query( ServerQueryPlotName, name );
     } );
 
-    const auto refTime = m_refTimeThread + ev.time;
-    m_refTimeThread = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeThread, evTime ) );
     if( m_data.lastTime < time ) m_data.lastTime = time;
-    switch( ev.type )
-    {
-    case PlotDataType::Double:
-        InsertPlot( plot, time, ev.data.d );
-        break;
-    case PlotDataType::Float:
-        InsertPlot( plot, time, (double)ev.data.f );
-        break;
-    case PlotDataType::Int:
-        InsertPlot( plot, time, (double)ev.data.i );
-        break;
-    default:
-        assert( false );
-        break;
-    }
+    InsertPlot( plot, time, val );
 }
 
 void Worker::ProcessPlotConfig( const QueuePlotConfig& ev )
@@ -5359,15 +5767,19 @@ void Worker::ProcessPlotConfig( const QueuePlotConfig& ev )
     } );
 
     plot->format = (PlotValueFormatting)ev.type;
+    plot->showSteps = ev.step;
+    plot->fill = ev.fill;
+    plot->color = ev.color & 0xFFFFFF;
 }
 
 void Worker::ProcessMessage( const QueueMessage& ev )
 {
+    auto td = GetCurrentThreadData();
     auto msg = m_slab.Alloc<MessageData>();
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     msg->time = time;
     msg->ref = StringRef( StringRef::Type::Idx, GetSingleStringIdx() );
-    msg->thread = CompressThread( m_threadCtx );
+    msg->thread = CompressThread( td->id );
     msg->color = 0xFFFFFFFF;
     msg->callstack.SetVal( 0 );
     if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -5376,12 +5788,13 @@ void Worker::ProcessMessage( const QueueMessage& ev )
 
 void Worker::ProcessMessageLiteral( const QueueMessageLiteral& ev )
 {
+    auto td = GetCurrentThreadData();
     CheckString( ev.text );
     auto msg = m_slab.Alloc<MessageData>();
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     msg->time = time;
     msg->ref = StringRef( StringRef::Type::Ptr, ev.text );
-    msg->thread = CompressThread( m_threadCtx );
+    msg->thread = CompressThread( td->id );
     msg->color = 0xFFFFFFFF;
     msg->callstack.SetVal( 0 );
     if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -5390,11 +5803,12 @@ void Worker::ProcessMessageLiteral( const QueueMessageLiteral& ev )
 
 void Worker::ProcessMessageColor( const QueueMessageColor& ev )
 {
+    auto td = GetCurrentThreadData();
     auto msg = m_slab.Alloc<MessageData>();
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     msg->time = time;
     msg->ref = StringRef( StringRef::Type::Idx, GetSingleStringIdx() );
-    msg->thread = CompressThread( m_threadCtx );
+    msg->thread = CompressThread( td->id );
     msg->color = 0xFF000000 | ( ev.r << 16 ) | ( ev.g << 8 ) | ev.b;
     msg->callstack.SetVal( 0 );
     if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -5403,12 +5817,13 @@ void Worker::ProcessMessageColor( const QueueMessageColor& ev )
 
 void Worker::ProcessMessageLiteralColor( const QueueMessageColorLiteral& ev )
 {
+    auto td = GetCurrentThreadData();
     CheckString( ev.text );
     auto msg = m_slab.Alloc<MessageData>();
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     msg->time = time;
     msg->ref = StringRef( StringRef::Type::Ptr, ev.text );
-    msg->thread = CompressThread( m_threadCtx );
+    msg->thread = CompressThread( td->id );
     msg->color = 0xFF000000 | ( ev.r << 16 ) | ( ev.g << 8 ) | ev.b;
     msg->callstack.SetVal( 0 );
     if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -5417,48 +5832,48 @@ void Worker::ProcessMessageLiteralColor( const QueueMessageColorLiteral& ev )
 
 void Worker::ProcessMessageCallstack( const QueueMessage& ev )
 {
+    auto td = GetCurrentThreadData();
     ProcessMessage( ev );
-    auto it = m_nextCallstack.find( m_threadCtx );
+    auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    assert( m_threadCtxData );
-    m_threadCtxData->messages.back()->callstack.SetVal( it->second );
+    td->messages.back()->callstack.SetVal( it->second );
     it->second = 0;
 }
 
 void Worker::ProcessMessageLiteralCallstack( const QueueMessageLiteral& ev )
 {
+    auto td = GetCurrentThreadData();
     ProcessMessageLiteral( ev );
-    auto it = m_nextCallstack.find( m_threadCtx );
+    auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    assert( m_threadCtxData );
-    m_threadCtxData->messages.back()->callstack.SetVal( it->second );
+    td->messages.back()->callstack.SetVal( it->second );
     it->second = 0;
 }
 
 void Worker::ProcessMessageColorCallstack( const QueueMessageColor& ev )
 {
+    auto td = GetCurrentThreadData();
     ProcessMessageColor( ev );
-    auto it = m_nextCallstack.find( m_threadCtx );
+    auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    assert( m_threadCtxData );
-    m_threadCtxData->messages.back()->callstack.SetVal( it->second );
+    td->messages.back()->callstack.SetVal( it->second );
     it->second = 0;
 }
 
 void Worker::ProcessMessageLiteralColorCallstack( const QueueMessageColorLiteral& ev )
 {
+    auto td = GetCurrentThreadData();
     ProcessMessageLiteralColor( ev );
-    auto it = m_nextCallstack.find( m_threadCtx );
+    auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    assert( m_threadCtxData );
-    m_threadCtxData->messages.back()->callstack.SetVal( it->second );
+    td->messages.back()->callstack.SetVal( it->second );
     it->second = 0;
 }
 
 void Worker::ProcessMessageAppInfo( const QueueMessage& ev )
 {
     m_data.appInfo.push_back( StringRef( StringRef::Type::Idx, GetSingleStringIdx() ) );
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -5477,7 +5892,7 @@ void Worker::ProcessGpuNewContext( const QueueGpuNewContext& ev )
         gpuTime = int64_t( double( ev.period ) * ev.gpuTime );      // precision loss
     }
 
-    const auto cpuTime = TscTime( ev.cpuTime - m_data.baseTime );
+    const auto cpuTime = TscTime( ev.cpuTime );
     auto gpu = m_slab.AllocInit<GpuCtxData>();
     memset( (char*)gpu->query, 0, sizeof( gpu->query ) );
     gpu->timeDiff = cpuTime - gpuTime;
@@ -5522,15 +5937,13 @@ void Worker::ProcessGpuZoneBeginImplCommon( GpuEvent* zone, const QueueGpuZoneBe
     int64_t cpuTime;
     if( serial )
     {
-        cpuTime = m_refTimeSerial + ev.cpuTime;
-        m_refTimeSerial = cpuTime;
+        cpuTime = RefTime( m_refTimeSerial, ev.cpuTime );
     }
     else
     {
-        cpuTime = m_refTimeThread + ev.cpuTime;
-        m_refTimeThread = cpuTime;
+        cpuTime = RefTime( m_refTimeThread, ev.cpuTime );
     }
-    const auto time = TscTime( cpuTime - m_data.baseTime );
+    const auto time = TscTime( cpuTime );
     zone->SetCpuStart( time );
     zone->SetCpuEnd( -1 );
     zone->SetGpuStart( -1 );
@@ -5598,7 +6011,8 @@ void Worker::ProcessGpuZoneBeginCallstack( const QueueGpuZoneBegin& ev, bool ser
     }
     else
     {
-        auto it = m_nextCallstack.find( m_threadCtx );
+        auto td = GetCurrentThreadData();
+        auto it = m_nextCallstack.find( td->id );
         assert( it != m_nextCallstack.end() );
         zone->callstack.SetVal( it->second );
         it->second = 0;
@@ -5623,7 +6037,8 @@ void Worker::ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLea
     }
     else
     {
-        auto it = m_nextCallstack.find( m_threadCtx );
+        auto td = GetCurrentThreadData();
+        auto it = m_nextCallstack.find( td->id );
         assert( it != m_nextCallstack.end() );
         zone->callstack.SetVal( it->second );
         it->second = 0;
@@ -5647,15 +6062,13 @@ void Worker::ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial )
     int64_t cpuTime;
     if( serial )
     {
-        cpuTime = m_refTimeSerial + ev.cpuTime;
-        m_refTimeSerial = cpuTime;
+        cpuTime = RefTime( m_refTimeSerial, ev.cpuTime );
     }
     else
     {
-        cpuTime = m_refTimeThread + ev.cpuTime;
-        m_refTimeThread = cpuTime;
+        cpuTime = RefTime( m_refTimeThread, ev.cpuTime );
     }
-    const auto time = TscTime( cpuTime - m_data.baseTime );
+    const auto time = TscTime( cpuTime );
     zone->SetCpuEnd( time );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
@@ -5665,10 +6078,8 @@ void Worker::ProcessGpuTime( const QueueGpuTime& ev )
     auto ctx = m_gpuCtxMap[ev.context];
     assert( ctx );
 
-    int64_t tgpu = m_refTimeGpu + ev.gpuTime;
-    m_refTimeGpu = tgpu;
-
-    if( tgpu < ctx->lastGpuTime )
+    int64_t tgpu = RefTime( m_refTimeGpu, ev.gpuTime );
+    if( tgpu < ctx->lastGpuTime - ( 1u << 31 ) )
     {
         if( ctx->overflow == 0 )
         {
@@ -5718,6 +6129,24 @@ void Worker::ProcessGpuTime( const QueueGpuTime& ev )
     else
     {
         zone->SetGpuEnd( gpuTime );
+#ifndef TRACY_NO_STATISTICS
+        const auto gpuStart = zone->GpuStart();
+        const auto timeSpan = gpuTime - gpuStart;
+        if( timeSpan > 0 )
+        {
+            GpuZoneThreadData ztd;
+            ztd.SetZone( zone );
+            ztd.SetThread( zone->Thread() );
+            auto slz = GetGpuSourceLocationZones( zone->SrcLoc() );
+            slz->zones.push_back( ztd );
+            if( slz->min > timeSpan ) slz->min = timeSpan;
+            if( slz->max < timeSpan ) slz->max = timeSpan;
+            slz->total += timeSpan;
+            slz->sumSq += double( timeSpan ) * timeSpan;
+        }
+#else
+        CountZoneStatistics( zone );
+#endif
     }
     if( m_data.lastTime < gpuTime ) m_data.lastTime = gpuTime;
 }
@@ -5742,7 +6171,7 @@ void Worker::ProcessGpuCalibration( const QueueGpuCalibration& ev )
     const auto gpuDelta = gpuTime - ctx->calibratedGpuTime;
     ctx->calibrationMod = double( cpuDelta ) / gpuDelta;
     ctx->calibratedGpuTime = gpuTime;
-    ctx->calibratedCpuTime = TscTime( ev.cpuTime - m_data.baseTime );
+    ctx->calibratedCpuTime = TscTime( ev.cpuTime );
 }
 
 void Worker::ProcessGpuContextName( const QueueGpuContextName& ev )
@@ -5761,9 +6190,7 @@ MemEvent* Worker::ProcessMemAllocImpl( uint64_t memname, MemData& memdata, const
         return nullptr;
     }
 
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeSerial, ev.time ) );
     if( m_data.lastTime < time ) m_data.lastTime = time;
     NoticeThread( ev.thread );
 
@@ -5800,8 +6227,7 @@ MemEvent* Worker::ProcessMemAllocImpl( uint64_t memname, MemData& memdata, const
 
 MemEvent* Worker::ProcessMemFreeImpl( uint64_t memname, MemData& memdata, const QueueMemFree& ev )
 {
-    const auto refTime = m_refTimeSerial + ev.time;
-    m_refTimeSerial = refTime;
+    const auto refTime = RefTime( m_refTimeSerial, ev.time );
 
     auto it = memdata.active.find( ev.ptr );
     if( it == memdata.active.end() )
@@ -5816,7 +6242,7 @@ MemEvent* Worker::ProcessMemFreeImpl( uint64_t memname, MemData& memdata, const 
         return nullptr;
     }
 
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( refTime );
     if( m_data.lastTime < time ) m_data.lastTime = time;
     NoticeThread( ev.thread );
 
@@ -5935,123 +6361,197 @@ void Worker::ProcessCallstackSerial()
 void Worker::ProcessCallstack()
 {
     assert( m_pendingCallstackId != 0 );
-    auto it = m_nextCallstack.find( m_threadCtx );
-    if( it == m_nextCallstack.end() ) it = m_nextCallstack.emplace( m_threadCtx, 0 ).first;
+    auto td = GetCurrentThreadData();
+    auto it = m_nextCallstack.find( td->id );
+    if( it == m_nextCallstack.end() ) it = m_nextCallstack.emplace( td->id, 0 ).first;
     assert( it->second == 0 );
     it->second = m_pendingCallstackId;
     m_pendingCallstackId = 0;
 }
 
-void Worker::ProcessCallstackSampleImpl( const SampleData& sd, ThreadData& td, int64_t t, uint32_t callstack )
+void Worker::ProcessCallstackSampleInsertSample( const SampleData& sd, ThreadData& td )
 {
-    assert( sd.time.Val() == t );
-    assert( sd.callstack.Val() == callstack );
-    m_data.samplesCnt++;
-
-    const auto& cs = GetCallstack( callstack );
-    const auto& ip = cs[0];
-    if( GetCanonicalPointer( ip ) >> 63 != 0 ) td.kernelSampleCnt++;
-
+    const auto t = sd.time.Val();
     if( td.samples.empty() )
     {
         td.samples.push_back( sd );
     }
-    else
+    else if( t != 0 && td.samples.back().time.Val() >= t )
     {
-        assert( td.samples.back().time.Val() < t );
-        td.samples.push_back_non_empty( sd );
-    }
-
-#ifndef TRACY_NO_STATISTICS
-    {
-        auto frame = GetCallstackFrame( ip );
-        if( frame )
+        m_inconsistentSamples = true;
+        auto it = std::lower_bound( td.samples.begin(), td.samples.end(), t, []( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs; } );
+        assert( it != td.samples.end() );
+        if( it->time.Val() != t )
         {
-            const auto symAddr = frame->data[0].symAddr;
-            auto it = m_data.instructionPointersMap.find( symAddr );
-            if( it == m_data.instructionPointersMap.end() )
-            {
-                m_data.instructionPointersMap.emplace( symAddr, unordered_flat_map<CallstackFrameId, uint32_t, CallstackFrameIdHash, CallstackFrameIdCompare> { { ip, 1 } } );
-            }
-            else
-            {
-                auto fit = it->second.find( ip );
-                if( fit == it->second.end() )
-                {
-                    it->second.emplace( ip, 1 );
-                }
-                else
-                {
-                    fit->second++;
-                }
-            }
-            auto sit = m_data.symbolSamples.find( symAddr );
-            if( sit == m_data.symbolSamples.end() )
-            {
-                m_data.symbolSamples.emplace( symAddr, Vector<SampleDataRange>( SampleDataRange { sd.time, ip } ) );
-            }
-            else
-            {
-                if( sit->second.back().time.Val() <= sd.time.Val() )
-                {
-                    sit->second.push_back_non_empty( SampleDataRange { sd.time, ip } );
-                }
-                else
-                {
-                    auto iit = std::upper_bound( sit->second.begin(), sit->second.end(), sd.time.Val(), [] ( const auto& lhs, const auto& rhs ) { return lhs < rhs.time.Val(); } );
-                    sit->second.insert( iit, SampleDataRange { sd.time, ip } );
-                }
-            }
+            td.samples.push_back_non_empty( sd );
         }
         else
         {
-            auto it = m_data.pendingInstructionPointers.find( ip );
-            if( it == m_data.pendingInstructionPointers.end() )
+            const auto mcs = MergeCallstacks( it->callstack.Val(), sd.callstack.Val() );
+            it->callstack.SetVal( mcs );
+
+            // This is a fixup of an already processed sample. Fixing stats is non-trivial, so just exit here.
+            return;
+        }
+    }
+    else
+    {
+        td.samples.push_back_non_empty( sd );
+    }
+
+    const auto callstack = sd.callstack.Val();
+    const auto& cs = GetCallstack( callstack );
+    const auto& ip = cs[0];
+    if( GetCanonicalPointer( ip ) >> 63 != 0 ) td.kernelSampleCnt++;
+    m_data.samplesCnt++;
+}
+
+void Worker::ProcessCallstackSampleImpl( const SampleData& sd, ThreadData& td )
+{
+    ProcessCallstackSampleInsertSample( sd, td );
+
+#ifndef TRACY_NO_STATISTICS
+    const auto t = sd.time.Val();
+    if( t == 0 || !m_identifySamples )
+    {
+        ProcessCallstackSampleImplStats( sd, td );
+    }
+    else
+    {
+        bool postpone = false;
+        auto ctx = GetContextSwitchData( td.id );
+        if( !ctx )
+        {
+            postpone = true;
+        }
+        else
+        {
+            auto it = std::lower_bound( ctx->v.begin(), ctx->v.end(), sd.time.Val(), [] ( const auto& l, const auto& r ) { return (uint64_t)l.End() < (uint64_t)r; } );
+            if( it == ctx->v.end() )
             {
-                m_data.pendingInstructionPointers.emplace( ip, 1 );
+                postpone = true;
+            }
+            else if( sd.time.Val() == it->Start() )
+            {
+                td.ctxSwitchSamples.push_back( sd );
             }
             else
             {
-                it->second++;
+                ProcessCallstackSampleImplStats( sd, td );
             }
-            auto sit = m_data.pendingSymbolSamples.find( ip );
-            if( sit == m_data.pendingSymbolSamples.end() )
+        }
+        if( postpone )
+        {
+            td.postponedSamples.push_back( sd );
+        }
+    }
+#endif
+}
+
+#ifndef TRACY_NO_STATISTICS
+void Worker::ProcessCallstackSampleImplStats( const SampleData& sd, ThreadData& td )
+{
+    const auto t = sd.time.Val();
+    const auto callstack = sd.callstack.Val();
+    const auto& cs = GetCallstack( callstack );
+    const auto& ip = cs[0];
+
+    uint16_t tid = CompressThread( td.id );
+
+    auto frame = GetCallstackFrame( ip );
+    if( frame )
+    {
+        const auto symAddr = frame->data[0].symAddr;
+        auto it = m_data.instructionPointersMap.find( symAddr );
+        if( it == m_data.instructionPointersMap.end() )
+        {
+            m_data.instructionPointersMap.emplace( symAddr, unordered_flat_map<CallstackFrameId, uint32_t, CallstackFrameIdHash, CallstackFrameIdCompare> { { ip, 1 } } );
+        }
+        else
+        {
+            auto fit = it->second.find( ip );
+            if( fit == it->second.end() )
             {
-                m_data.pendingSymbolSamples.emplace( ip, Vector<SampleDataRange>( SampleDataRange { sd.time, ip } ) );
+                it->second.emplace( ip, 1 );
             }
             else
             {
-                sit->second.push_back_non_empty( SampleDataRange { sd.time, ip } );
+                fit->second++;
+            }
+        }
+        auto sit = m_data.symbolSamples.find( symAddr );
+        if( sit == m_data.symbolSamples.end() )
+        {
+            m_data.symbolSamples.emplace( symAddr, Vector<SampleDataRange>( SampleDataRange { sd.time, tid, ip } ) );
+        }
+        else
+        {
+            if( sit->second.back().time.Val() <= sd.time.Val() )
+            {
+                sit->second.push_back_non_empty( SampleDataRange { sd.time, tid, ip } );
+            }
+            else
+            {
+                auto iit = std::upper_bound( sit->second.begin(), sit->second.end(), sd.time.Val(), [] ( const auto& lhs, const auto& rhs ) { return lhs < rhs.time.Val(); } );
+                sit->second.insert( iit, SampleDataRange { sd.time, tid, ip } );
             }
         }
     }
+    else
+    {
+        auto it = m_data.pendingInstructionPointers.find( ip );
+        if( it == m_data.pendingInstructionPointers.end() )
+        {
+            m_data.pendingInstructionPointers.emplace( ip, 1 );
+        }
+        else
+        {
+            it->second++;
+        }
+        auto sit = m_data.pendingSymbolSamples.find( ip );
+        if( sit == m_data.pendingSymbolSamples.end() )
+        {
+            m_data.pendingSymbolSamples.emplace( ip, Vector<SampleDataRange>( SampleDataRange { sd.time, tid,  ip } ) );
+        }
+        else
+        {
+            sit->second.push_back_non_empty( SampleDataRange { sd.time, tid, ip } );
+        }
+    }
+
+    auto childAddr = GetCanonicalPointer( cs[0] );
     for( uint16_t i=1; i<cs.size(); i++ )
     {
         auto addr = GetCanonicalPointer( cs[i] );
         auto it = m_data.childSamples.find( addr );
         if( it == m_data.childSamples.end() )
         {
-            m_data.childSamples.emplace( addr, Vector<Int48>( sd.time ) );
+            m_data.childSamples.emplace( addr, Vector<ChildSample>( ChildSample { sd.time, childAddr } ) );
         }
         else
         {
-            it->second.push_back_non_empty( sd.time );
+            it->second.push_back_non_empty( ChildSample { sd.time, childAddr } );
         }
+        childAddr = addr;
     }
 
     const auto framesKnown = UpdateSampleStatistics( callstack, 1, true );
-    assert( td.samples.size() > td.ghostIdx );
-    if( framesKnown && td.ghostIdx + 1 == td.samples.size() )
+
+    if( t != 0 )
     {
-        td.ghostIdx++;
-        m_data.ghostCnt += AddGhostZone( cs, &td.ghostZones, t );
+        assert( td.samples.size() > td.ghostIdx );
+        if( framesKnown && td.ghostIdx + 1 == td.samples.size() )
+        {
+            td.ghostIdx++;
+            m_data.ghostCnt += AddGhostZone( cs, &td.ghostZones, t );
+        }
+        else
+        {
+            m_data.ghostZonesPostponed = true;
+        }
     }
-    else
-    {
-        m_data.ghostZonesPostponed = true;
-    }
-#endif
 }
+#endif
 
 void Worker::ProcessCallstackSample( const QueueCallstackSample& ev )
 {
@@ -6059,9 +6559,8 @@ void Worker::ProcessCallstackSample( const QueueCallstackSample& ev )
     const auto callstack = m_pendingCallstackId;
     m_pendingCallstackId = 0;
 
-    const auto refTime = m_refTimeCtx + ev.time;
-    m_refTimeCtx = refTime;
-    const auto t = TscTime( refTime - m_data.baseTime );
+    const auto refTime = RefTime( m_refTimeCtx, ev.time );
+    const auto t = refTime == 0 ? 0 : TscTime( refTime );
 
     auto& td = *NoticeThread( ev.thread );
 
@@ -6069,7 +6568,7 @@ void Worker::ProcessCallstackSample( const QueueCallstackSample& ev )
     sd.time.SetVal( t );
     sd.callstack.SetVal( callstack );
 
-    if( m_combineSamples )
+    if( m_combineSamples && t != 0 )
     {
         const auto pendingTime = td.pendingSample.time.Val();
         if( pendingTime == 0 )
@@ -6080,50 +6579,42 @@ void Worker::ProcessCallstackSample( const QueueCallstackSample& ev )
         {
             if( pendingTime == t )
             {
-                const auto& cs1 = GetCallstack( td.pendingSample.callstack.Val() );
-                const auto& cs2 = GetCallstack( callstack );
-
-                const auto sz1 = cs1.size();
-                const auto sz2 = cs2.size();
-                const auto tsz = sz1 + sz2;
-
-                size_t memsize = sizeof( VarArray<CallstackFrameId> ) + tsz * sizeof( CallstackFrameId );
-                auto mem = (char*)m_slab.AllocRaw( memsize );
-                memcpy( mem, cs1.data(), sizeof( CallstackFrameId ) * sz1 );
-                memcpy( mem + sizeof( CallstackFrameId ) * sz1, cs2.data(), sizeof( CallstackFrameId ) * sz2 );
-
-                VarArray<CallstackFrameId>* arr = (VarArray<CallstackFrameId>*)( mem + tsz * sizeof( CallstackFrameId ) );
-                new(arr) VarArray<CallstackFrameId>( tsz, (CallstackFrameId*)mem );
-
-                uint32_t idx;
-                auto it = m_data.callstackMap.find( arr );
-                if( it == m_data.callstackMap.end() )
-                {
-                    idx = m_data.callstackPayload.size();
-                    m_data.callstackMap.emplace( arr, idx );
-                    m_data.callstackPayload.push_back( arr );
-                }
-                else
-                {
-                    idx = it->second;
-                    m_slab.Unalloc( memsize );
-                }
-
-                sd.callstack.SetVal( idx );
-                ProcessCallstackSampleImpl( sd, td, pendingTime, idx );
+                const auto mcs = MergeCallstacks( td.pendingSample.callstack.Val(), callstack );
+                sd.callstack.SetVal( mcs );
+                ProcessCallstackSampleImpl( sd, td );
                 td.pendingSample.time.Clear();
             }
             else
             {
-                ProcessCallstackSampleImpl( td.pendingSample, td, pendingTime, td.pendingSample.callstack.Val() );
+                ProcessCallstackSampleImpl( td.pendingSample, td );
                 td.pendingSample = sd;
             }
         }
     }
     else
     {
-        ProcessCallstackSampleImpl( sd, td, t, callstack );
+        ProcessCallstackSampleImpl( sd, td );
     }
+}
+
+void Worker::ProcessCallstackSampleContextSwitch( const QueueCallstackSample& ev )
+{
+    assert( m_pendingCallstackId != 0 );
+    const auto callstack = m_pendingCallstackId;
+    m_pendingCallstackId = 0;
+
+    const auto refTime = RefTime( m_refTimeCtx, ev.time );
+    const auto t = refTime == 0 ? 0 : TscTime( refTime );
+
+    auto& td = *NoticeThread( ev.thread );
+
+    SampleData sd;
+    sd.time.SetVal( t );
+    sd.callstack.SetVal( callstack );
+
+    ProcessCallstackSampleInsertSample( sd, td );
+
+    td.ctxSwitchSamples.push_back( sd );
 }
 
 void Worker::ProcessCallstackFrameSize( const QueueCallstackFrameSize& ev )
@@ -6199,7 +6690,7 @@ void Worker::ProcessCallstackFrame( const QueueCallstackFrame& ev, bool querySym
 
         StringRef ref( StringRef::Idx, fitidx );
         auto cit = m_checkedFileStrings.find( ref );
-        if( cit == m_checkedFileStrings.end() ) CacheSource( ref );
+        if( cit == m_checkedFileStrings.end() ) CacheSource( ref, m_callstackFrameStaging->imageName );
 
         const auto frameId = PackPointer( m_callstackFrameStagingPtr );
 #ifndef TRACY_NO_STATISTICS
@@ -6256,6 +6747,7 @@ void Worker::ProcessCallstackFrame( const QueueCallstackFrame& ev, bool querySym
         {
             assert( m_data.callstackFrameMap.find( frameId ) == m_data.callstackFrameMap.end() );
             m_data.callstackFrameMap.emplace( frameId, m_callstackFrameStaging );
+            m_data.codeSymbolMap.emplace( m_callstackFrameStagingPtr, m_callstackFrameStaging->data[0].symAddr );
             m_callstackFrameStaging = nullptr;
         }
     }
@@ -6283,10 +6775,9 @@ void Worker::ProcessSymbolInformation( const QueueSymbolInformation& ev )
     sd.size.SetVal( it->second.size );
     m_data.symbolMap.emplace( ev.symAddr, std::move( sd ) );
 
-    if( m_codeTransfer && it->second.size > 0 && it->second.size <= 128*1024 && ( ev.symAddr >> 63 ) == 0 )
+    if( m_codeTransfer && it->second.size > 0 && it->second.size <= 128*1024 )
     {
-        assert( m_pendingSymbolCode.find( ev.symAddr ) == m_pendingSymbolCode.end() );
-        m_pendingSymbolCode.emplace( ev.symAddr );
+        m_pendingSymbolCode++;
         Query( ServerQuerySymbolCode, ev.symAddr, it->second.size );
     }
 
@@ -6303,56 +6794,21 @@ void Worker::ProcessSymbolInformation( const QueueSymbolInformation& ev )
 
     StringRef ref( StringRef::Idx, idx );
     auto cit = m_checkedFileStrings.find( ref );
-    if( cit == m_checkedFileStrings.end() ) CacheSource( ref );
+    if( cit == m_checkedFileStrings.end() ) CacheSource( ref, it->second.imageName );
 
     m_pendingSymbols.erase( it );
-}
-
-void Worker::ProcessCodeInformation( const QueueCodeInformation& ev )
-{
-    assert( m_pendingCodeInformation > 0 );
-    m_pendingCodeInformation--;
-
-    const auto idx = GetSingleStringIdx();
-
-    if( ev.line != 0 )
-    {
-        assert( m_data.codeAddressToLocation.find( ev.ptr ) == m_data.codeAddressToLocation.end() );
-        const auto packed = PackFileLine( idx, ev.line );
-        m_data.codeAddressToLocation.emplace( ev.ptr, packed );
-
-        auto lit = m_data.locationCodeAddressList.find( packed );
-        if( lit == m_data.locationCodeAddressList.end() )
-        {
-            m_data.locationCodeAddressList.emplace( packed, Vector<uint64_t>( ev.ptr ) );
-        }
-        else
-        {
-            const bool needSort = lit->second.back() > ev.ptr;
-            lit->second.push_back( ev.ptr );
-            if( needSort ) pdqsort_branchless( lit->second.begin(), lit->second.end() );
-        }
-
-        StringRef ref( StringRef::Idx, idx );
-        auto cit = m_checkedFileStrings.find( ref );
-        if( cit == m_checkedFileStrings.end() ) CacheSource( ref );
-    }
-    if( ev.symAddr != 0 )
-    {
-        assert( m_data.codeSymbolMap.find( ev.ptr ) == m_data.codeSymbolMap.end() );
-        m_data.codeSymbolMap.emplace( ev.ptr, ev.symAddr );
-    }
 }
 
 void Worker::ProcessCrashReport( const QueueCrashReport& ev )
 {
     CheckString( ev.text );
 
-    m_data.crashEvent.thread = m_threadCtx;
-    m_data.crashEvent.time = TscTime( ev.time - m_data.baseTime );
+    auto td = GetCurrentThreadData();
+    m_data.crashEvent.thread = td->id;
+    m_data.crashEvent.time = TscTime( ev.time );
     m_data.crashEvent.message = ev.text;
 
-    auto it = m_nextCallstack.find( m_threadCtx );
+    auto it = m_nextCallstack.find( td->id );
     if( it != m_nextCallstack.end() && it->second != 0 )
     {
         m_data.crashEvent.callstack = it->second;
@@ -6366,7 +6822,7 @@ void Worker::ProcessCrashReport( const QueueCrashReport& ev )
 
 void Worker::ProcessSysTime( const QueueSysTime& ev )
 {
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = TscTime( ev.time );
     if( m_data.lastTime < time ) m_data.lastTime = time;
     const auto val = ev.sysTime;
     if( !m_sysTimePlot )
@@ -6375,8 +6831,12 @@ void Worker::ProcessSysTime( const QueueSysTime& ev )
         m_sysTimePlot->name = 0;
         m_sysTimePlot->type = PlotType::SysTime;
         m_sysTimePlot->format = PlotValueFormatting::Percentage;
+        m_sysTimePlot->showSteps = false;
+        m_sysTimePlot->fill = true;
+        m_sysTimePlot->color = 0;
         m_sysTimePlot->min = val;
         m_sysTimePlot->max = val;
+        m_sysTimePlot->sum = val;
         m_sysTimePlot->data.push_back( { time, val } );
         m_data.plots.Data().push_back( m_sysTimePlot );
     }
@@ -6386,15 +6846,18 @@ void Worker::ProcessSysTime( const QueueSysTime& ev )
         assert( m_sysTimePlot->data.back().time.Val() <= time );
         if( m_sysTimePlot->min > val ) m_sysTimePlot->min = val;
         else if( m_sysTimePlot->max < val ) m_sysTimePlot->max = val;
+        m_sysTimePlot->sum += val;
         m_sysTimePlot->data.push_back( { time, val } );
     }
 }
 
 void Worker::ProcessContextSwitch( const QueueContextSwitch& ev )
 {
-    const auto refTime = m_refTimeCtx + ev.time;
-    m_refTimeCtx = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+#ifndef TRACY_NO_STATISTICS
+    m_data.newContextSwitchesReceived = true;
+#endif
+
+    const auto time = TscTime( RefTime( m_refTimeCtx, ev.time ) );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 
     if( ev.cpu >= m_data.cpuDataCount ) m_data.cpuDataCount = ev.cpu + 1;
@@ -6465,6 +6928,7 @@ void Worker::ProcessContextSwitch( const QueueContextSwitch& ev )
         item->SetCpu( ev.cpu );
         item->SetReason( -1 );
         item->SetState( -1 );
+        item->SetThread( 0 );
 
         auto& cx = cs.push_next();
         cx.SetStart( time );
@@ -6487,9 +6951,7 @@ void Worker::ProcessContextSwitch( const QueueContextSwitch& ev )
 
 void Worker::ProcessThreadWakeup( const QueueThreadWakeup& ev )
 {
-    const auto refTime = m_refTimeCtx + ev.time;
-    m_refTimeCtx = refTime;
-    const auto time = TscTime( refTime - m_data.baseTime );
+    const auto time = TscTime( RefTime( m_refTimeCtx, ev.time ) );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 
     auto it = m_data.ctxSwitch.find( ev.thread );
@@ -6507,6 +6969,7 @@ void Worker::ProcessThreadWakeup( const QueueThreadWakeup& ev )
     item.SetCpu( 0 );
     item.SetReason( ContextSwitchData::Wakeup );
     item.SetState( -1 );
+    item.SetThread( 0 );
 }
 
 void Worker::ProcessTidToPid( const QueueTidToPid& ev )
@@ -6516,7 +6979,7 @@ void Worker::ProcessTidToPid( const QueueTidToPid& ev )
 
 void Worker::ProcessHwSampleCpuCycle( const QueueHwSample& ev )
 {
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = ev.time == 0 ? 0 : TscTime( ev.time );
     auto it = m_data.hwSamples.find( ev.ip );
     if( it == m_data.hwSamples.end() ) it = m_data.hwSamples.emplace( ev.ip, HwSampleData {} ).first;
     it->second.cycles.push_back( time );
@@ -6524,7 +6987,7 @@ void Worker::ProcessHwSampleCpuCycle( const QueueHwSample& ev )
 
 void Worker::ProcessHwSampleInstructionRetired( const QueueHwSample& ev )
 {
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = ev.time == 0 ? 0 : TscTime( ev.time );
     auto it = m_data.hwSamples.find( ev.ip );
     if( it == m_data.hwSamples.end() ) it = m_data.hwSamples.emplace( ev.ip, HwSampleData {} ).first;
     it->second.retired.push_back( time );
@@ -6532,7 +6995,7 @@ void Worker::ProcessHwSampleInstructionRetired( const QueueHwSample& ev )
 
 void Worker::ProcessHwSampleCacheReference( const QueueHwSample& ev )
 {
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = ev.time == 0 ? 0 : TscTime( ev.time );
     auto it = m_data.hwSamples.find( ev.ip );
     if( it == m_data.hwSamples.end() ) it = m_data.hwSamples.emplace( ev.ip, HwSampleData {} ).first;
     it->second.cacheRef.push_back( time );
@@ -6540,7 +7003,7 @@ void Worker::ProcessHwSampleCacheReference( const QueueHwSample& ev )
 
 void Worker::ProcessHwSampleCacheMiss( const QueueHwSample& ev )
 {
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = ev.time == 0 ? 0 : TscTime( ev.time );
     auto it = m_data.hwSamples.find( ev.ip );
     if( it == m_data.hwSamples.end() ) it = m_data.hwSamples.emplace( ev.ip, HwSampleData {} ).first;
     it->second.cacheMiss.push_back( time );
@@ -6548,15 +7011,16 @@ void Worker::ProcessHwSampleCacheMiss( const QueueHwSample& ev )
 
 void Worker::ProcessHwSampleBranchRetired( const QueueHwSample& ev )
 {
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = ev.time == 0 ? 0 : TscTime( ev.time );
     auto it = m_data.hwSamples.find( ev.ip );
     if( it == m_data.hwSamples.end() ) it = m_data.hwSamples.emplace( ev.ip, HwSampleData {} ).first;
     it->second.branchRetired.push_back( time );
+    m_data.hasBranchRetirement = true;
 }
 
 void Worker::ProcessHwSampleBranchMiss( const QueueHwSample& ev )
 {
-    const auto time = TscTime( ev.time - m_data.baseTime );
+    const auto time = ev.time == 0 ? 0 : TscTime( ev.time );
     auto it = m_data.hwSamples.find( ev.ip );
     if( it == m_data.hwSamples.end() ) it = m_data.hwSamples.emplace( ev.ip, HwSampleData {} ).first;
     it->second.branchMiss.push_back( time );
@@ -6566,6 +7030,13 @@ void Worker::ProcessParamSetup( const QueueParamSetup& ev )
 {
     CheckString( ev.name );
     m_params.push_back( Parameter { ev.idx, StringRef( StringRef::Ptr, ev.name ), bool( ev.isBool ), ev.val } );
+}
+
+void Worker::ProcessSourceCodeNotAvailable( const QueueSourceCodeNotAvailable& ev )
+{
+    auto it = m_sourceCodeQuery.find( ev.id );
+    assert( it != m_sourceCodeQuery.end() );
+    m_sourceCodeQuery.erase( it );
 }
 
 void Worker::ProcessCpuTopology( const QueueCpuTopology& ev )
@@ -6586,6 +7057,77 @@ void Worker::ProcessMemNamePayload( const QueueMemNamePayload& ev )
     m_memNamePayload = ev.name;
 }
 
+void Worker::ProcessFiberEnter( const QueueFiberEnter& ev )
+{
+    const auto t = TscTime( RefTime( m_refTimeThread, ev.time ) );
+    if( m_data.lastTime < t ) m_data.lastTime = t;
+
+    uint64_t tid;
+    auto it = m_data.fiberToThreadMap.find( ev.fiber );
+    if( it == m_data.fiberToThreadMap.end() )
+    {
+        tid = ( uint64_t(1) << 32 ) | m_data.fiberToThreadMap.size();
+        m_data.fiberToThreadMap.emplace( ev.fiber, tid );
+        NewThread( tid, true );
+        CheckFiberName( ev.fiber, tid );
+    }
+    else
+    {
+        tid = it->second;
+    }
+
+    auto td = NoticeThread( ev.thread );
+    if( td->fiber )
+    {
+        auto cit = m_data.ctxSwitch.find( td->fiber->id );
+        assert( cit != m_data.ctxSwitch.end() );
+        auto& data = cit->second->v;
+        assert( !data.empty() );
+        auto& item = data.back();
+        item.SetEnd( t );
+    }
+    td->fiber = RetrieveThread( tid );
+    assert( td->fiber );
+
+    auto cit = m_data.ctxSwitch.find( tid );
+    if( cit == m_data.ctxSwitch.end() )
+    {
+        auto ctx = m_slab.AllocInit<ContextSwitch>();
+        cit = m_data.ctxSwitch.emplace( tid, ctx ).first;
+    }
+    auto& data = cit->second->v;
+    auto& item = data.push_next();
+    item.SetStartCpu( t, 0 );
+    item.SetWakeup( t );
+    item.SetEndReasonState( -1, ContextSwitchData::Fiber, -1 );
+    item.SetThread( CompressThread( ev.thread ) );
+}
+
+void Worker::ProcessFiberLeave( const QueueFiberLeave& ev )
+{
+    const auto t = TscTime( RefTime( m_refTimeThread, ev.time ) );
+    if( m_data.lastTime < t ) m_data.lastTime = t;
+
+    auto td = RetrieveThread( ev.thread );
+    if( !td->fiber )
+    {
+        FiberLeaveFailure();
+        return;
+    }
+
+    auto cit = m_data.ctxSwitch.find( td->fiber->id );
+    assert( cit != m_data.ctxSwitch.end() );
+    auto& data = cit->second->v;
+    assert( !data.empty() );
+    auto& item = data.back();
+    item.SetEnd( t );
+
+    const auto dt = t - item.Start();
+    cit->second->runningTime += dt;
+
+    td->fiber = nullptr;
+}
+
 void Worker::MemAllocChanged( uint64_t memname, MemData& memdata, int64_t time )
 {
     const auto val = (double)memdata.usage;
@@ -6594,6 +7136,7 @@ void Worker::MemAllocChanged( uint64_t memname, MemData& memdata, int64_t time )
         CreateMemAllocPlot( memdata );
         memdata.plot->min = val;
         memdata.plot->max = val;
+        memdata.plot->sum = val;
         memdata.plot->data.push_back( { time, val } );
     }
     else
@@ -6602,6 +7145,7 @@ void Worker::MemAllocChanged( uint64_t memname, MemData& memdata, int64_t time )
         assert( memdata.plot->data.back().time.Val() <= time );
         if( memdata.plot->min > val ) memdata.plot->min = val;
         else if( memdata.plot->max < val ) memdata.plot->max = val;
+        memdata.plot->sum += val;
         memdata.plot->data.push_back( { time, val } );
     }
 }
@@ -6613,6 +7157,9 @@ void Worker::CreateMemAllocPlot( MemData& memdata )
     memdata.plot->name = memdata.name;
     memdata.plot->type = PlotType::Memory;
     memdata.plot->format = PlotValueFormatting::Memory;
+    memdata.plot->showSteps = true;
+    memdata.plot->fill = true;
+    memdata.plot->color = 0;
     memdata.plot->data.push_back( { GetFrameBegin( *m_data.framesBase, 0 ), 0. } );
     m_data.plots.Data().push_back( memdata.plot );
 }
@@ -6631,18 +7178,22 @@ void Worker::ReconstructMemAllocPlot( MemData& mem )
     {
         std::lock_guard<std::mutex> lock( m_data.lock );
         plot = m_slab.AllocInit<PlotData>();
+        plot->data.reserve_exact( psz, m_slab );
     }
 
     plot->name = mem.name;
     plot->type = PlotType::Memory;
     plot->format = PlotValueFormatting::Memory;
-    plot->data.reserve_exact( psz, m_slab );
+    plot->showSteps = true;
+    plot->fill = true;
+    plot->color = 0;
 
     auto aptr = mem.data.begin();
     auto aend = mem.data.end();
     auto fptr = mem.frees.begin();
     auto fend = mem.frees.end();
 
+    double sum = 0;
     double max = 0;
     double usage = 0;
 
@@ -6663,6 +7214,7 @@ void Worker::ReconstructMemAllocPlot( MemData& mem )
                 usage += int64_t( aptr->Size() );
                 assert( usage >= 0 );
                 if( max < usage ) max = usage;
+                sum += usage;
                 ptr->time = atime;
                 ptr->val = usage;
                 ptr++;
@@ -6675,6 +7227,7 @@ void Worker::ReconstructMemAllocPlot( MemData& mem )
                 usage -= int64_t( mem.data[*fptr].Size() );
                 assert( usage >= 0 );
                 if( max < usage ) max = usage;
+                sum += usage;
                 ptr->time = ftime;
                 ptr->val = usage;
                 ptr++;
@@ -6692,6 +7245,7 @@ void Worker::ReconstructMemAllocPlot( MemData& mem )
         usage += int64_t( aptr->Size() );
         assert( usage >= 0 );
         if( max < usage ) max = usage;
+        sum += usage;
         ptr->time = time;
         ptr->val = usage;
         ptr++;
@@ -6704,6 +7258,7 @@ void Worker::ReconstructMemAllocPlot( MemData& mem )
         usage -= int64_t( memData.Size() );
         assert( usage >= 0 );
         assert( max >= usage );
+        sum += usage;
         ptr->time = time;
         ptr->val = usage;
         ptr++;
@@ -6712,6 +7267,7 @@ void Worker::ReconstructMemAllocPlot( MemData& mem )
 
     plot->min = 0;
     plot->max = max;
+    plot->sum = sum;
 
     std::lock_guard<std::mutex> lock( m_data.lock );
     m_data.plots.Data().insert( m_data.plots.Data().begin(), plot );
@@ -6885,13 +7441,13 @@ void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint
     const auto fxsz = fexcl->size;
     const auto& frame0 = fexcl->data[0];
     auto sym0 = m_data.symbolStats.find( frame0.symAddr );
-    if( sym0 == m_data.symbolStats.end() ) sym0 = m_data.symbolStats.emplace( frame0.symAddr, SymbolStats { 0, 0, unordered_flat_map<uint32_t, uint32_t>() } ).first;
+    if( sym0 == m_data.symbolStats.end() ) sym0 = m_data.symbolStats.emplace( frame0.symAddr, SymbolStats { 0, 0 } ).first;
     sym0->second.excl += count;
     for( uint8_t f=1; f<fxsz; f++ )
     {
         const auto& frame = fexcl->data[f];
         auto sym = m_data.symbolStats.find( frame.symAddr );
-        if( sym == m_data.symbolStats.end() ) sym = m_data.symbolStats.emplace( frame.symAddr, SymbolStats { 0, 0, unordered_flat_map<uint32_t, uint32_t>() } ).first;
+        if( sym == m_data.symbolStats.end() ) sym = m_data.symbolStats.emplace( frame.symAddr, SymbolStats { 0, 0 } ).first;
         sym->second.incl += count;
     }
     for( uint16_t c=1; c<framesCount; c++ )
@@ -6902,7 +7458,7 @@ void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint
         {
             const auto& frame = fincl->data[f];
             auto sym = m_data.symbolStats.find( frame.symAddr );
-            if( sym == m_data.symbolStats.end() ) sym = m_data.symbolStats.emplace( frame.symAddr, SymbolStats { 0, 0, unordered_flat_map<uint32_t, uint32_t>() } ).first;
+            if( sym == m_data.symbolStats.end() ) sym = m_data.symbolStats.emplace( frame.symAddr, SymbolStats { 0, 0 } ).first;
             sym->second.incl += count;
         }
     }
@@ -6941,54 +7497,96 @@ void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint
         }
     }
 
-    const auto sz = framesCount - ( fxsz == 1 );
-    const auto memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
-    auto mem = (char*)m_slab.AllocRaw( memsize );
-
-    auto data = (CallstackFrameId*)mem;
-    auto dst = data;
-    if( fxsz == 1 )
+    uint32_t parentIdx;
     {
-        for( int i=0; i<sz; i++ )
+        const auto sz = framesCount - ( fxsz == 1 );
+        const auto memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
+        auto mem = (char*)m_slab.AllocRaw( memsize );
+
+        auto data = (CallstackFrameId*)mem;
+        auto dst = data;
+        if( fxsz == 1 )
         {
-            *dst++ = cs[i+1];
+            for( int i=0; i<sz; i++ )
+            {
+                *dst++ = cs[i+1];
+            }
         }
-    }
-    else
-    {
-        *dst++ = parentFrameId;
-        for( int i=1; i<sz; i++ )
+        else
         {
-            *dst++ = cs[i];
+            *dst++ = parentFrameId;
+            for( int i=1; i<sz; i++ )
+            {
+                *dst++ = cs[i];
+            }
         }
-    }
 
-    auto arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
-    new(arr) VarArray<CallstackFrameId>( sz, data );
+        auto arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
+        new(arr) VarArray<CallstackFrameId>( sz, data );
 
-    uint32_t idx;
-    auto it = m_data.parentCallstackMap.find( arr );
-    if( it == m_data.parentCallstackMap.end() )
-    {
-        idx = m_data.parentCallstackPayload.size();
-        m_data.parentCallstackMap.emplace( arr, idx );
-        m_data.parentCallstackPayload.push_back( arr );
-    }
-    else
-    {
-        idx = it->second;
-        m_slab.Unalloc( memsize );
+        auto it = m_data.parentCallstackMap.find( arr );
+        if( it == m_data.parentCallstackMap.end() )
+        {
+            parentIdx = m_data.parentCallstackPayload.size();
+            m_data.parentCallstackMap.emplace( arr, parentIdx );
+            m_data.parentCallstackPayload.push_back( arr );
+        }
+        else
+        {
+            parentIdx = it->second;
+            m_slab.Unalloc( memsize );
+        }
     }
 
     sym0 = m_data.symbolStats.find( frame0.symAddr );
-    auto sit = sym0->second.parents.find( idx );
+    auto sit = sym0->second.parents.find( parentIdx );
     if( sit == sym0->second.parents.end() )
     {
-        sym0->second.parents.emplace( idx, count );
+        sym0->second.parents.emplace( parentIdx, count );
     }
     else
     {
         sit->second += count;
+    }
+
+    uint32_t baseParentIdx;
+    {
+        const auto sz = framesCount - 1;
+        const auto memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
+        auto mem = (char*)m_slab.AllocRaw( memsize );
+
+        auto data = (CallstackFrameId*)mem;
+        auto dst = data;
+        for( int i=0; i<sz; i++ )
+        {
+            *dst++ = cs[i+1];
+        }
+
+        auto arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
+        new(arr) VarArray<CallstackFrameId>( sz, data );
+
+        auto it = m_data.parentCallstackMap.find( arr );
+        if( it == m_data.parentCallstackMap.end() )
+        {
+            baseParentIdx = m_data.parentCallstackPayload.size();
+            m_data.parentCallstackMap.emplace( arr, baseParentIdx );
+            m_data.parentCallstackPayload.push_back( arr );
+        }
+        else
+        {
+            baseParentIdx = it->second;
+            m_slab.Unalloc( memsize );
+        }
+    }
+
+    auto bit = sym0->second.baseParents.find( baseParentIdx );
+    if( bit == sym0->second.baseParents.end() )
+    {
+        sym0->second.baseParents.emplace( baseParentIdx, count );
+    }
+    else
+    {
+        bit->second += count;
     }
 }
 #endif
@@ -7016,23 +7614,6 @@ int64_t Worker::ReadTimelineHaveSize( FileRead& f, ZoneEvent* zone, int64_t refT
     }
 }
 
-void Worker::ReadTimelinePre063( FileRead& f, ZoneEvent* zone, int64_t& refTime, int32_t& childIdx, int fileVer )
-{
-    uint64_t sz;
-    f.Read( sz );
-    if( sz == 0 )
-    {
-        zone->SetChild( -1 );
-    }
-    else
-    {
-        const auto idx = childIdx;
-        childIdx++;
-        zone->SetChild( idx );
-        ReadTimelinePre063( f, m_data.zoneChildren[idx], sz, refTime, childIdx, fileVer );
-    }
-}
-
 void Worker::ReadTimeline( FileRead& f, GpuEvent* zone, int64_t& refTime, int64_t& refGpuTime, int32_t& childIdx )
 {
     uint64_t sz;
@@ -7056,7 +7637,7 @@ void Worker::ReadTimelineHaveSize( FileRead& f, GpuEvent* zone, int64_t& refTime
 }
 
 #ifndef TRACY_NO_STATISTICS
-void Worker::ReconstructZoneStatistics( SrcLocCountMap& countMap, ZoneEvent& zone, uint16_t thread )
+void Worker::ReconstructZoneStatistics( uint8_t* countMap, ZoneEvent& zone, uint16_t thread )
 {
     assert( zone.IsEndValid() );
     auto timeSpan = zone.End() - zone.Start();
@@ -7073,8 +7654,7 @@ void Worker::ReconstructZoneStatistics( SrcLocCountMap& countMap, ZoneEvent& zon
         if( slz.max < timeSpan ) slz.max = timeSpan;
         slz.total += timeSpan;
         slz.sumSq += double( timeSpan ) * timeSpan;
-        const auto isReentry = HasSrcLocCount( countMap, zone.SrcLoc() );
-        if( !isReentry )
+        if( countMap[uint16_t(zone.SrcLoc())] == 0 )
         {
             slz.nonReentrantCount++;
             if( slz.nonReentrantMin > timeSpan ) slz.nonReentrantMin = timeSpan;
@@ -7097,10 +7677,39 @@ void Worker::ReconstructZoneStatistics( SrcLocCountMap& countMap, ZoneEvent& zon
         slz.selfTotal += timeSpan;
     }
 }
+
+void Worker::ReconstructZoneStatistics( GpuEvent& zone, uint16_t thread )
+{
+    assert( zone.GpuEnd() >= 0 );
+    auto timeSpan = zone.GpuEnd() - zone.GpuStart();
+    if( timeSpan > 0 )
+    {
+        auto it = m_data.gpuSourceLocationZones.find( zone.SrcLoc() );
+        if( it == m_data.gpuSourceLocationZones.end() )
+        {
+            it = m_data.gpuSourceLocationZones.emplace( zone.SrcLoc(), GpuSourceLocationZones {} ).first;
+        }
+        GpuZoneThreadData ztd;
+        ztd.SetZone( &zone );
+        ztd.SetThread( thread );
+        auto& slz = it->second;
+        slz.zones.push_back( ztd );
+        if( slz.min > timeSpan ) slz.min = timeSpan;
+        if( slz.max < timeSpan ) slz.max = timeSpan;
+        slz.total += timeSpan;
+        slz.sumSq += double( timeSpan ) * timeSpan;
+    }
+}
 #else
 void Worker::CountZoneStatistics( ZoneEvent* zone )
 {
     auto cnt = GetSourceLocationZonesCnt( zone->SrcLoc() );
+    (*cnt)++;
+}
+
+void Worker::CountZoneStatistics( GpuEvent* zone )
+{
+    auto cnt = GetGpuSourceLocationZonesCnt( zone->SrcLoc() );
     (*cnt)++;
 }
 #endif
@@ -7150,45 +7759,6 @@ int64_t Worker::ReadTimeline( FileRead& f, Vector<short_ptr<ZoneEvent>>& _vec, u
     return refTime;
 }
 
-void Worker::ReadTimelinePre063( FileRead& f, Vector<short_ptr<ZoneEvent>>& _vec, uint64_t size, int64_t& refTime, int32_t& childIdx, int fileVer )
-{
-    assert( fileVer < FileVersion( 0, 6, 3 ) );
-    assert( size != 0 );
-    const auto lp = s_loadProgress.subProgress.load( std::memory_order_relaxed );
-    s_loadProgress.subProgress.store( lp + size, std::memory_order_relaxed );
-    auto& vec = *(Vector<ZoneEvent>*)( &_vec );
-    vec.set_magic();
-    vec.reserve_exact( size, m_slab );
-    auto zone = vec.begin();
-    auto end = vec.end();
-    do
-    {
-        int16_t srcloc;
-        f.Read( srcloc );
-        zone->SetSrcLoc( srcloc );
-        f.Read( &zone->_end_child1, sizeof( zone->_end_child1 ) );
-        ZoneExtra extra;
-        f.Read( &extra.text, sizeof( extra.text ) );
-        f.Read( &extra.callstack, sizeof( extra.callstack ) );
-        f.Read( &extra.name, sizeof( extra.name ) );
-        zone->extra = 0;
-        if( extra.callstack.Val() != 0 || extra.name.Active() || extra.text.Active() )
-        {
-            memcpy( &AllocZoneExtra( *zone ), &extra, sizeof( ZoneExtra ) );
-        }
-        refTime += zone->_end_child1;
-        zone->SetStart( refTime - m_data.baseTime );
-        ReadTimelinePre063( f, zone, refTime, childIdx, fileVer );
-        int64_t end = ReadTimeOffset( f, refTime );
-        if( end >= 0 ) end -= m_data.baseTime;
-        zone->SetEnd( end );
-#ifdef TRACY_NO_STATISTICS
-        CountZoneStatistics( zone );
-#endif
-    }
-    while( ++zone != end );
-}
-
 void Worker::ReadTimeline( FileRead& f, Vector<short_ptr<GpuEvent>>& _vec, uint64_t size, int64_t& refTime, int64_t& refGpuTime, int32_t& childIdx )
 {
     assert( size != 0 );
@@ -7226,7 +7796,8 @@ void Worker::ReadTimeline( FileRead& f, Vector<short_ptr<GpuEvent>>& _vec, uint6
 
 void Worker::Disconnect()
 {
-    Query( ServerQueryDisconnect, 0 );
+    //Query( ServerQueryDisconnect, 0 );
+    Shutdown();
     m_disconnect = true;
 }
 
@@ -7247,7 +7818,7 @@ static void WriteHwSampleVec( FileWrite& f, SortedVector<Int48, Int48Sort>& vec 
 
 void Worker::Write( FileWrite& f, bool fiDict )
 {
-    DoPostponedWork();
+    DoPostponedWorkAll();
 
     f.Write( FileHeader, sizeof( FileHeader ) );
 
@@ -7401,10 +7972,30 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &id, sizeof( id ) );
         f.Write( &cnt, sizeof( cnt ) );
     }
+
+    sz = m_data.gpuSourceLocationZones.size();
+    f.Write( &sz, sizeof( sz ) );
+    for( auto& v : m_data.gpuSourceLocationZones )
+    {
+        int16_t id = v.first;
+        uint64_t cnt = v.second.zones.size();
+        f.Write( &id, sizeof( id ) );
+        f.Write( &cnt, sizeof( cnt ) );
+    }
 #else
     sz = m_data.sourceLocationZonesCnt.size();
     f.Write( &sz, sizeof( sz ) );
     for( auto& v : m_data.sourceLocationZonesCnt )
+    {
+        int16_t id = v.first;
+        uint64_t cnt = v.second;
+        f.Write( &id, sizeof( id ) );
+        f.Write( &cnt, sizeof( cnt ) );
+    }
+
+    sz = m_data.gpuSourceLocationZonesCnt.size();
+    f.Write( &sz, sizeof( sz ) );
+    for( auto& v : m_data.gpuSourceLocationZonesCnt )
     {
         int16_t id = v.first;
         uint64_t cnt = v.second;
@@ -7475,6 +8066,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &thread->id, sizeof( thread->id ) );
         f.Write( &thread->count, sizeof( thread->count ) );
         f.Write( &thread->kernelSampleCnt, sizeof( thread->kernelSampleCnt ) );
+        f.Write( &thread->isFiber, sizeof( thread->isFiber ) );
         WriteTimeline( f, thread->timeline, refTime );
         sz = thread->messages.size();
         f.Write( &sz, sizeof( sz ) );
@@ -7482,6 +8074,22 @@ void Worker::Write( FileWrite& f, bool fiDict )
         {
             auto ptr = uint64_t( (MessageData*)v );
             f.Write( &ptr, sizeof( ptr ) );
+        }
+        sz = thread->ctxSwitchSamples.size();
+        f.Write( &sz, sizeof( sz ) );
+        refTime = 0;
+        for( auto& v : thread->ctxSwitchSamples )
+        {
+            WriteTimeOffset( f, refTime, v.time.Val() );
+            f.Write( &v.callstack, sizeof( v.callstack ) );
+        }
+        if( m_inconsistentSamples )
+        {
+#ifdef NO_PARALLEL_SORT
+            pdqsort_branchless( thread->samples.begin(), thread->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
+#else
+            std::sort( std::execution::par_unseq, thread->samples.begin(), thread->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
+#endif
         }
         sz = thread->samples.size();
         f.Write( &sz, sizeof( sz ) );
@@ -7530,9 +8138,13 @@ void Worker::Write( FileWrite& f, bool fiDict )
         if( plot->type == PlotType::Memory ) continue;
         f.Write( &plot->type, sizeof( plot->type ) );
         f.Write( &plot->format, sizeof( plot->format ) );
+        f.Write( &plot->showSteps, sizeof( plot->showSteps ) );
+        f.Write( &plot->fill, sizeof( plot->fill ) );
+        f.Write( &plot->color, sizeof( plot->color ) );
         f.Write( &plot->name, sizeof( plot->name ) );
         f.Write( &plot->min, sizeof( plot->min ) );
         f.Write( &plot->max, sizeof( plot->max ) );
+        f.Write( &plot->sum, sizeof( plot->sum ) );
         int64_t refTime = 0;
         sz = plot->data.size();
         f.Write( &sz, sizeof( sz ) );
@@ -7594,7 +8206,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     f.Write( &sz, sizeof( sz ) );
     for( size_t i=1; i<=sz; i++ )
     {
-        auto cs = m_data.callstackPayload[i];
+        auto& cs = m_data.callstackPayload[i];
         uint16_t csz = cs->size();
         f.Write( &csz, sizeof( csz ) );
         f.Write( cs->data(), sizeof( CallstackFrameId ) * csz );
@@ -7652,13 +8264,23 @@ void Worker::Write( FileWrite& f, bool fiDict )
             params.zParams.compressionLevel = 3;
 
             auto dict = new char[DictSize];
-            const auto finalDictSize = (uint32_t)ZDICT_optimizeTrainFromBuffer_fastCover( dict, DictSize, sdata, ssize, sNum, &params );
-            auto zdict = ZSTD_createCDict( dict, finalDictSize, 3 );
+            const auto dictret = ZDICT_optimizeTrainFromBuffer_fastCover( dict, DictSize, sdata, ssize, sNum, &params );
+            if( dictret <= DictSize )
+            {
+                const auto finalDictSize = uint32_t( dictret );
+                auto zdict = ZSTD_createCDict( dict, finalDictSize, 3 );
 
-            f.Write( &finalDictSize, sizeof( finalDictSize ) );
-            f.Write( dict, finalDictSize );
+                f.Write( &finalDictSize, sizeof( finalDictSize ) );
+                f.Write( dict, finalDictSize );
 
-            ZSTD_freeCDict( zdict );
+                ZSTD_freeCDict( zdict );
+            }
+            else
+            {
+                uint32_t zero = 0;
+                f.Write( &zero, sizeof( zero ) );
+            }
+
             delete[] dict;
             delete[] ssize;
             delete[] sdata;
@@ -7706,9 +8328,11 @@ void Worker::Write( FileWrite& f, bool fiDict )
             uint8_t cpu = cs.Cpu();
             int8_t reason = cs.Reason();
             int8_t state = cs.State();
+            uint64_t thread = DecompressThread( cs.Thread() );
             f.Write( &cpu, sizeof( cpu ) );
             f.Write( &reason, sizeof( reason ) );
             f.Write( &state, sizeof( state ) );
+            f.Write( &thread, sizeof( thread ) );
         }
     }
 
@@ -7763,23 +8387,6 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &v.first, sizeof( v.first ) );
         f.Write( &v.second.len, sizeof( v.second.len ) );
         f.Write( v.second.data, v.second.len );
-    }
-
-    sz = m_data.locationCodeAddressList.size();
-    f.Write( &sz, sizeof( sz ) );
-    for( auto& v : m_data.locationCodeAddressList )
-    {
-        f.Write( &v.first, sizeof( v.first ) );
-        uint16_t lsz = uint16_t( v.second.size() );
-        f.Write( &lsz, sizeof( lsz ) );
-        uint64_t ref = 0;
-        const uint64_t* ptr = v.second.data();
-        for( uint16_t i=0; i<lsz; i++ )
-        {
-            uint64_t diff = *ptr++ - ref;
-            ref += diff;
-            f.Write( &diff, sizeof( diff ) );
-        }
     }
 
     sz = m_data.codeSymbolMap.size();
@@ -7903,6 +8510,7 @@ static const char* s_failureReasons[] = {
     "Invalid order of zone begin and end events.",
     "Zone is ended twice.",
     "Zone text transfer destination doesn't match active zone.",
+    "Zone value transfer destination doesn't match active zone.",
     "Zone color transfer destination doesn't match active zone.",
     "Zone name transfer destination doesn't match active zone.",
     "Memory free event without a matching allocation.",
@@ -7910,6 +8518,7 @@ static const char* s_failureReasons[] = {
     "Discontinuous frame begin/end mismatch.",
     "Frame image offset is invalid.",
     "Multiple frame images were sent for a single frame.",
+    "Fiber execution stopped on a thread which is not executing a fiber.",
 };
 
 static_assert( sizeof( s_failureReasons ) / sizeof( *s_failureReasons ) == (int)Worker::Failure::NUM_FAILURES, "Missing failure reason description." );
@@ -7956,7 +8565,7 @@ ZoneExtra& Worker::RequestZoneExtra( ZoneEvent& ev )
     }
 }
 
-void Worker::CacheSource( const StringRef& str )
+void Worker::CacheSource( const StringRef& str, const StringIdx& image )
 {
     assert( str.active );
     assert( m_checkedFileStrings.find( str ) == m_checkedFileStrings.end() );
@@ -7967,20 +8576,24 @@ void Worker::CacheSource( const StringRef& str )
     const auto execTime = GetExecutableTime();
     if( SourceFileValid( file, execTime != 0 ? execTime : GetCaptureTime() ) )
     {
-        FILE* f = fopen( file, "rb" );
-        fseek( f, 0, SEEK_END );
-        const auto sz = ftell( f );
-        fseek( f, 0, SEEK_SET );
-        auto src = (char*)m_slab.AllocBig( sz );
-        fread( src, 1, sz, f );
-        fclose( f );
-        m_data.sourceFileCache.emplace( file, MemoryBlock{ src, uint32_t( sz ) } );
+        CacheSourceFromFile( file );
     }
     else if( execTime != 0 )
     {
-        m_sourceCodeQuery.emplace_back( file );
-        QuerySourceFile( file );
+        QuerySourceFile( file, image.Active() ? GetString( image ) : nullptr );
     }
+}
+
+void Worker::CacheSourceFromFile( const char* fn )
+{
+    FILE* f = fopen( fn, "rb" );
+    fseek( f, 0, SEEK_END );
+    const auto sz = ftell( f );
+    fseek( f, 0, SEEK_SET );
+    auto src = (char*)m_slab.AllocBig( sz );
+    fread( src, 1, sz, f );
+    fclose( f );
+    m_data.sourceFileCache.emplace( fn, MemoryBlock{ src, uint32_t( sz ) } );
 }
 
 uint64_t Worker::GetSourceFileCacheSize() const
@@ -8020,6 +8633,38 @@ uint64_t Worker::GetHwSampleCount() const
         cnt += v.second.branchMiss.size();
     }
     return cnt;
+}
+
+void Worker::CacheSourceFiles()
+{
+    const auto execTime = GetExecutableTime();
+
+    for( auto& sl : m_data.sourceLocationPayload )
+    {
+        const char* file = GetString( sl->file );
+        if( m_data.sourceFileCache.find( file ) == m_data.sourceFileCache.end() )
+        {
+            if( SourceFileValid( file, execTime != 0 ? execTime : GetCaptureTime() ) ) CacheSourceFromFile( file );
+        }
+    }
+
+    for( auto& sl : m_data.sourceLocation )
+    {
+        const char* file = GetString( sl.second.file );
+        if( m_data.sourceFileCache.find( file ) == m_data.sourceFileCache.end() )
+        {
+            if( SourceFileValid( file, execTime != 0 ? execTime : GetCaptureTime() ) ) CacheSourceFromFile( file );
+        }
+    }
+
+    for( auto& sym : m_data.symbolMap )
+    {
+        const char* file = GetString( sym.second.file );
+        if( m_data.sourceFileCache.find( file ) == m_data.sourceFileCache.end() )
+        {
+            if( SourceFileValid( file, execTime != 0 ? execTime : GetCaptureTime() ) ) CacheSourceFromFile( file );
+        }
+    }
 }
 
 }

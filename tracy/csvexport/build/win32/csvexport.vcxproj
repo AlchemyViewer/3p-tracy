@@ -21,13 +21,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
@@ -44,6 +44,9 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup />
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -54,12 +57,12 @@
       <PreprocessorDefinitions>_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;WIN32_LEAN_AND_MEAN;NOMINMAX;_USE_MATH_DEFINES;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <LanguageStandard>stdcpplatest</LanguageStandard>
-      <AdditionalIncludeDirectories>..\..\..\vcpkg\vcpkg\installed\x64-windows-static\include;..\..\..\vcpkg\vcpkg\installed\x64-windows-static\include\capstone;$(VcpkgInstalledDir)$(VcpkgTriplet)\include\capstone</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\..\vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)..\..\..\vcpkg_installed\$(VcpkgTriplet)\include\capstone;$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\include\capstone;$(VcpkgRoot)\installed\$(VcpkgTriplet)\include\capstone</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <AdditionalDependencies>ws2_32.lib;capstone.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Console</SubSystem>
-      <AdditionalLibraryDirectories>..\..\..\vcpkg\vcpkg\installed\x64-windows-static\debug\lib</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\..\..\vcpkg_installed\$(VcpkgTriplet)\debug\lib</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -74,23 +77,23 @@
       <PreprocessorDefinitions>NDEBUG;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;WIN32_LEAN_AND_MEAN;NOMINMAX;_USE_MATH_DEFINES;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <LanguageStandard>stdcpplatest</LanguageStandard>
-      <AdditionalIncludeDirectories>..\..\..\vcpkg\vcpkg\installed\x64-windows-static\include;..\..\..\vcpkg\vcpkg\installed\x64-windows-static\include\capstone;$(VcpkgInstalledDir)$(VcpkgTriplet)\include\capstone</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\..\vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)..\..\..\vcpkg_installed\$(VcpkgTriplet)\include\capstone;$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\include\capstone;$(VcpkgRoot)\installed\$(VcpkgTriplet)\include\capstone</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalDependencies>ws2_32.lib;capstone.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Console</SubSystem>
-      <AdditionalLibraryDirectories>..\..\..\vcpkg\vcpkg\installed\x64-windows-static\lib</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\..\..\vcpkg_installed\$(VcpkgTriplet)\lib</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\..\common\TracySocket.cpp" />
-    <ClCompile Include="..\..\..\common\TracyStackFrames.cpp" />
-    <ClCompile Include="..\..\..\common\TracySystem.cpp" />
-    <ClCompile Include="..\..\..\common\tracy_lz4.cpp" />
-    <ClCompile Include="..\..\..\common\tracy_lz4hc.cpp" />
     <ClCompile Include="..\..\..\getopt\getopt.c" />
+    <ClCompile Include="..\..\..\public\common\TracySocket.cpp" />
+    <ClCompile Include="..\..\..\public\common\TracyStackFrames.cpp" />
+    <ClCompile Include="..\..\..\public\common\TracySystem.cpp" />
+    <ClCompile Include="..\..\..\public\common\tracy_lz4.cpp" />
+    <ClCompile Include="..\..\..\public\common\tracy_lz4hc.cpp" />
     <ClCompile Include="..\..\..\server\TracyMemory.cpp" />
     <ClCompile Include="..\..\..\server\TracyMmap.cpp" />
     <ClCompile Include="..\..\..\server\TracyPrint.cpp" />
@@ -130,18 +133,22 @@
     <ClCompile Include="..\..\src\csvexport.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\..\common\TracyAlign.hpp" />
-    <ClInclude Include="..\..\..\common\TracyAlloc.hpp" />
-    <ClInclude Include="..\..\..\common\TracyColor.hpp" />
-    <ClInclude Include="..\..\..\common\TracyForceInline.hpp" />
-    <ClInclude Include="..\..\..\common\TracyProtocol.hpp" />
-    <ClInclude Include="..\..\..\common\TracyQueue.hpp" />
-    <ClInclude Include="..\..\..\common\TracySocket.hpp" />
-    <ClInclude Include="..\..\..\common\TracyStackFrames.hpp" />
-    <ClInclude Include="..\..\..\common\TracySystem.hpp" />
-    <ClInclude Include="..\..\..\common\tracy_lz4.hpp" />
-    <ClInclude Include="..\..\..\common\tracy_lz4hc.hpp" />
     <ClInclude Include="..\..\..\getopt\getopt.h" />
+    <ClInclude Include="..\..\..\public\common\TracyAlign.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyAlloc.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyApi.h" />
+    <ClInclude Include="..\..\..\public\common\TracyColor.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyForceInline.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyMutex.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyProtocol.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyQueue.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracySocket.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyStackFrames.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracySystem.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyUwp.hpp" />
+    <ClInclude Include="..\..\..\public\common\TracyYield.hpp" />
+    <ClInclude Include="..\..\..\public\common\tracy_lz4.hpp" />
+    <ClInclude Include="..\..\..\public\common\tracy_lz4hc.hpp" />
     <ClInclude Include="..\..\..\server\TracyCharUtil.hpp" />
     <ClInclude Include="..\..\..\server\TracyEvent.hpp" />
     <ClInclude Include="..\..\..\server\TracyFileRead.hpp" />
@@ -165,11 +172,13 @@
     <ClInclude Include="..\..\..\zstd\common\huf.h" />
     <ClInclude Include="..\..\..\zstd\common\mem.h" />
     <ClInclude Include="..\..\..\zstd\common\pool.h" />
+    <ClInclude Include="..\..\..\zstd\common\portability_macros.h" />
     <ClInclude Include="..\..\..\zstd\common\threading.h" />
     <ClInclude Include="..\..\..\zstd\common\xxhash.h" />
     <ClInclude Include="..\..\..\zstd\common\zstd_deps.h" />
     <ClInclude Include="..\..\..\zstd\common\zstd_internal.h" />
     <ClInclude Include="..\..\..\zstd\common\zstd_trace.h" />
+    <ClInclude Include="..\..\..\zstd\compress\clevels.h" />
     <ClInclude Include="..\..\..\zstd\compress\hist.h" />
     <ClInclude Include="..\..\..\zstd\compress\zstdmt_compress.h" />
     <ClInclude Include="..\..\..\zstd\compress\zstd_compress_internal.h" />
@@ -191,6 +200,9 @@
     <ClInclude Include="..\..\..\zstd\zdict.h" />
     <ClInclude Include="..\..\..\zstd\zstd.h" />
     <ClInclude Include="..\..\..\zstd\zstd_errors.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\..\zstd\decompress\huf_decompress_amd64.S" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

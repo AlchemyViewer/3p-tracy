@@ -2,7 +2,7 @@
 #include <mutex>
 #include <thread>
 #include <stdlib.h>
-#include "../Tracy.hpp"
+#include "Tracy.hpp"
 #include "../common/TracySystem.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -189,6 +189,7 @@ void DepthTest()
     tracy::SetThreadName( "Depth test" );
     for(;;)
     {
+        std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
         ZoneScoped;
         const auto txt = "Fibonacci (15)";
         ZoneText( txt, strlen( txt ) );

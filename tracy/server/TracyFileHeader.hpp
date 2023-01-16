@@ -1,7 +1,9 @@
 #ifndef __TRACYFILEHEADER_HPP__
 #define __TRACYFILEHEADER_HPP__
 
-#include "../common/TracyForceInline.hpp"
+#include <stdint.h>
+
+#include "../public/common/TracyForceInline.hpp"
 
 namespace tracy
 {
