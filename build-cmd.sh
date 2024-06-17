@@ -50,7 +50,7 @@ pushd "$source_dir"
 
             mkdir -p "build_debug"
             pushd "build_debug"
-                cmake .. -G "$AUTOBUILD_WIN_CMAKE_GEN" -A "$AUTOBUILD_WIN_VSPLATFORM" .. \
+                cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Debug .. \
                         -DCMAKE_INSTALL_PREFIX="$(cygpath -m $stage_dir)/debug" \
                         -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
 
@@ -60,7 +60,7 @@ pushd "$source_dir"
 
             mkdir -p "build_release"
             pushd "build_release"
-                cmake .. -G "$AUTOBUILD_WIN_CMAKE_GEN" -A "$AUTOBUILD_WIN_VSPLATFORM" .. \
+                cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release .. \
                         -DCMAKE_INSTALL_PREFIX="$(cygpath -m $stage_dir)/release" \
                         -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
 
@@ -89,9 +89,15 @@ pushd "$source_dir"
         ;;
 
         darwin*)
-			cmake . -DCMAKE_INSTALL_PREFIX:STRING="${stage_dir}"
-            make
-            make install
+            mkdir -p "build"
+            pushd "build"
+                cmake .. -G "Ninja Multi-Config" -DCMAKE_BUILD_TYPE=Release .. \
+                        -DCMAKE_INSTALL_PREFIX="${stage_dir}" \
+                        -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
+
+                cmake --build . --config Release
+                cmake --install . --config Release
+            popd
 
             mkdir -p "$stage_dir/lib/release"
             mv "$stage_dir/lib/libtracy.a" "$stage_dir/lib/release/libtracy.a"
