@@ -75,11 +75,11 @@ pushd "$source_dir"
 
             cmd.exe /c $(cygpath -w "vcpkg/install_vcpkg_dependencies.bat")
 
-            build_sln "capture/build/win32/capture.sln" "Release|x64"
-            build_sln "csvexport/build/win32/csvexport.sln" "Release|x64"
-            build_sln "import-chrome/build/win32/import-chrome.sln" "Release|x64"
-            build_sln "profiler/build/win32/Tracy.sln" "Release|x64"
-            build_sln "update/build/win32/update.sln" "Release|x64"
+            msbuild.exe $(cygpath -w "capture/build/win32/capture.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
+            msbuild.exe $(cygpath -w "csvexport/build/win32/csvexport.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
+            msbuild.exe $(cygpath -w "import-chrome/build/win32/import-chrome.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
+            msbuild.exe $(cygpath -w "profiler/build/win32/Tracy.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
+            msbuild.exe $(cygpath -w "update/build/win32/update.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
 
             cp -a capture/build/win32/x64/Release/capture.exe $stage_dir/tools/tracy/
             cp -a csvexport/build/win32/x64/Release/csvexport.exe $stage_dir/tools/tracy/
