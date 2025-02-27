@@ -133,9 +133,6 @@ pushd "build"
         ;;
 
         linux*)
-            # force CPM dependencies glfw and freetype to be built statically to make built executables easier to deploy anywhere
-            patch --directory "$top/$source_dir" -p1 < "$top/tracy-deps-static.patch"
-
             mkdir -p "$stage_dir/bin"
             mkdir -p "capture"
             pushd "capture"
