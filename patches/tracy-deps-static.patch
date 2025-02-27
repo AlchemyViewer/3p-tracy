@@ -22,3 +22,4 @@ index 29f12cfa..fa280da8 100644
      )
      add_library(TracyFreetype INTERFACE)
      target_link_libraries(TracyFreetype INTERFACE freetype)
+     

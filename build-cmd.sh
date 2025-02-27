@@ -39,6 +39,14 @@ echo "${tracy_version}.${build_id}" > "${stage_dir}/VERSION.txt"
 
 source_dir="tracy"
 
+# remove_cxxstd apply_patch
+source "$(dirname "$AUTOBUILD_VARIABLES_FILE")/functions"
+
+apply_patch "$top/patches/fix-msvc-build.patch" "$source_dir"
+
+# force CPM dependencies glfw and freetype to be built statically to make built executables easier to deploy anywhere
+apply_patch "$top/patches/tracy-deps-static.patch" "$source_dir"
+
 mkdir -p "build"
 pushd "build"
     case "$AUTOBUILD_PLATFORM" in
@@ -83,9 +91,6 @@ pushd "build"
             export MACOSX_DEPLOYMENT_TARGET="$LL_BUILD_DARWIN_DEPLOY_TARGET"
             export MACOSX_ARCHITECTURES="arm64;x86_64"
             export MACOSX_EXTRA_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET='${MACOSX_DEPLOYMENT_TARGET}' -DCMAKE_OSX_ARCHITECTURES='${MACOSX_ARCHITECTURES}' -DCMAKE_IGNORE_PREFIX_PATH='/usr/local/'"
-
-            # force CPM dependencies glfw and freetype to be built statically to make built executables easier to deploy anywhere
-            patch --directory "$top/$source_dir" -p1 < "$top/tracy-deps-static.patch"
 
             mkdir -p "$stage_dir/bin"
             mkdir -p "capture"
