@@ -1,25 +1,27 @@
 name: Build
-on: [push]
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
 jobs:
   build:
     strategy:
       matrix:
-        os: [windows-2022]
+        os: [windows-2022, macos-15, ubuntu-22.04]
         addrsize: ["64"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: AlchemyViewer/action-autobuild@v4
+      - uses: AlchemyViewer/action-autobuild@v5
         with:
           addrsize: ${{ matrix.addrsize }}
-          build-variables-repo: alchemyviewer/build-variables
-          build-variables-ref: alchemy
-          apt-packages: ninja-build
+          apt-packages: ninja-build libdbus-1-dev libfreetype-dev libtbb-dev libwayland-dev wayland-protocols libxcursor-dev libxi-dev libxinerama-dev libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev libglvnd-dev libopengl-dev libgl-dev libegl-dev
           brew-packages: ninja
   release:
     needs: build
     runs-on: [ubuntu-latest]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: alchemyviewer/action-autobuild-release@v4
+      - uses: AlchemyViewer/action-autobuild-release@v4
         with:
           public: true

@@ -1,0 +1,24 @@
+diff --git a/cmake/vendor.cmake b/cmake/vendor.cmake
+index 29f12cfa..fa280da8 100644
+--- a/cmake/vendor.cmake
++++ b/cmake/vendor.cmake
+@@ -49,6 +49,7 @@ if(NOT USE_WAYLAND AND NOT EMSCRIPTEN)
+                 "GLFW_BUILD_TESTS OFF"
+                 "GLFW_BUILD_DOCS OFF"
+                 "GLFW_INSTALL OFF"
++                "GLFW_LIBRARY_TYPE STATIC"
+         )
+         add_library(TracyGlfw3 INTERFACE)
+         target_link_libraries(TracyGlfw3 INTERFACE glfw)
+@@ -70,6 +71,11 @@ else()
+         OPTIONS
+             "FT_DISABLE_HARFBUZZ ON"
+             "FT_WITH_HARFBUZZ OFF"
++            "FT_DISABLE_ZLIB ON"
++            "FT_DISABLE_BZIP2 ON"
++            "FT_DISABLE_PNG ON"
++            "FT_DISABLE_BROTLI ON"
++            "BUILD_SHARED_LIBS OFF"
+     )
+     add_library(TracyFreetype INTERFACE)
+     target_link_libraries(TracyFreetype INTERFACE freetype)

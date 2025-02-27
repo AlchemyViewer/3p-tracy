@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-cd "$(dirname "$0")" 
+cd "$(dirname "$0")"
 
 echo "Building tracy library"
 
@@ -12,7 +12,7 @@ set -e
 set -u
 
 # Check autobuild is around or fail
-if [ -z "$AUTOBUILD" ] ; then 
+if [ -z "$AUTOBUILD" ] ; then
     exit 1
 fi
 
@@ -33,82 +33,149 @@ srcenv_file="$tmp_dir/ab_srcenv.sh"
 "$autobuild" source_environment > "$srcenv_file"
 . "$srcenv_file"
 
+build_id=${AUTOBUILD_BUILD_ID:=0}
 tracy_version="$(sed -n -E 's/(v[0-9]+\.[0-9]+\.[0-9]+) \(.+\)/\1/p' tracy/NEWS | head -1)"
-echo "${tracy_version}" > "${stage_dir}/VERSION.txt"
+echo "${tracy_version}.${build_id}" > "${stage_dir}/VERSION.txt"
 
 source_dir="tracy"
-pushd "$source_dir"
+
+mkdir -p "build"
+pushd "build"
     case "$AUTOBUILD_PLATFORM" in
         windows*)
             load_vsvars
+            mkdir -p "$stage_dir/bin"
+            mkdir -p "capture"
+            pushd "capture"
+                cmake $(cygpath -m "$top/$source_dir/capture") -G Ninja -DCMAKE_BUILD_TYPE=Release
+                cmake --build . --config Release
 
-            # First build the client lib
-            mkdir -p "$stage_dir/tools/tracy"
-            mkdir -p "$stage_dir/include/tracy"
-            mkdir -p "$stage_dir/lib/debug"
-            mkdir -p "$stage_dir/lib/release"
-
-            mkdir -p "build_debug"
-            pushd "build_debug"
-                cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Debug .. \
-                        -DCMAKE_INSTALL_PREFIX="$(cygpath -m $stage_dir)/debug" \
-                        -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
-
-                cmake --build . --config Debug --clean-first
-                cmake --install . --config Debug
+                cp -a tracy-capture.exe $stage_dir/bin
             popd
 
-            mkdir -p "build_release"
-            pushd "build_release"
-                cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release .. \
-                        -DCMAKE_INSTALL_PREFIX="$(cygpath -m $stage_dir)/release" \
-                        -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
+            mkdir -p "csvexport"
+            pushd "csvexport"
+                cmake $(cygpath -m "$top/$source_dir/csvexport") -G Ninja -DCMAKE_BUILD_TYPE=Release
+                cmake --build . --config Release
 
-                cmake --build . --config Release --clean-first
-                cmake --install . --config Release
+                cp -a tracy-csvexport.exe $stage_dir/bin
             popd
 
-            cp -a $stage_dir/debug/lib/*.lib $stage_dir/lib/debug/
-            cp -a $stage_dir/release/lib/*.lib $stage_dir/lib/release/
+            mkdir -p "profiler"
+            pushd "profiler"
+                cmake $(cygpath -m "$top/$source_dir/profiler") -G Ninja -DCMAKE_BUILD_TYPE=Release
+                cmake --build . --config Release
 
-            cp -a $stage_dir/release/include/* $stage_dir/include/tracy
+                cp -a tracy-profiler.exe $stage_dir/bin
+            popd
 
-            cmd.exe /c $(cygpath -w "vcpkg/install_vcpkg_dependencies.bat")
+            mkdir -p "update"
+            pushd "update"
+                cmake $(cygpath -m "$top/$source_dir/update") -G Ninja -DCMAKE_BUILD_TYPE=Release
+                cmake --build . --config Release
 
-            msbuild.exe $(cygpath -w "capture/build/win32/capture.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
-            msbuild.exe $(cygpath -w "csvexport/build/win32/csvexport.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
-            msbuild.exe $(cygpath -w "import-chrome/build/win32/import-chrome.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
-            msbuild.exe $(cygpath -w "profiler/build/win32/Tracy.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
-            msbuild.exe $(cygpath -w "update/build/win32/update.sln") /p:Configuration=Release /p:Platform=$AUTOBUILD_WIN_VSPLATFORM
-
-            cp -a capture/build/win32/x64/Release/capture.exe $stage_dir/tools/tracy/
-            cp -a csvexport/build/win32/x64/Release/csvexport.exe $stage_dir/tools/tracy/
-            cp -a import-chrome/build/win32/x64/Release/import-chrome.exe $stage_dir/tools/tracy/
-            cp -a profiler/build/win32/x64/Release/Tracy.exe $stage_dir/tools/tracy/
-            cp -a update/build/win32/x64/Release/update.exe $stage_dir/tools/tracy/
+                cp -a tracy-update.exe $stage_dir/bin
+            popd
+# See common code below that copies haders to packages/include/
         ;;
 
         darwin*)
-            mkdir -p "build"
-            pushd "build"
-                cmake .. -G "Ninja Multi-Config" -DCMAKE_BUILD_TYPE=Release .. \
-                        -DCMAKE_INSTALL_PREFIX="${stage_dir}" \
-                        -DTRACY_ON_DEMAND=ON -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON
+            export MACOSX_DEPLOYMENT_TARGET="$LL_BUILD_DARWIN_DEPLOY_TARGET"
+            export MACOSX_ARCHITECTURES="arm64;x86_64"
+            export MACOSX_EXTRA_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET='${MACOSX_DEPLOYMENT_TARGET}' -DCMAKE_OSX_ARCHITECTURES='${MACOSX_ARCHITECTURES}' -DCMAKE_IGNORE_PREFIX_PATH='/usr/local/'"
+
+            # force CPM dependencies glfw and freetype to be built statically to make built executables easier to deploy anywhere
+            patch --directory "$top/$source_dir" -p1 < "$top/tracy-deps-static.patch"
+
+            mkdir -p "$stage_dir/bin"
+            mkdir -p "capture"
+            pushd "capture"
+                cmake "$top/$source_dir/capture" -G Ninja ${MACOSX_EXTRA_CMAKE_ARGS} \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
 
                 cmake --build . --config Release
-                cmake --install . --config Release
+
+                cp -a tracy-capture $stage_dir/bin
             popd
 
-            mkdir -p "$stage_dir/lib/release"
-            mv "$stage_dir/lib/libtracy.a" "$stage_dir/lib/release/libtracy.a"
+            mkdir -p "csvexport"
+            pushd "csvexport"
+                cmake "$top/$source_dir/csvexport" -G Ninja ${MACOSX_EXTRA_CMAKE_ARGS} \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
+                cmake --build . --config Release
 
-            mkdir -p "$stage_dir/include/tracy"
-            cp Tracy.hpp "$stage_dir/include/tracy/"
-			cp TracyOpenGL.hpp "$stage_dir/include/tracy/"
+                cp -a tracy-csvexport $stage_dir/bin
+            popd
 
-            rm -r "$stage_dir/lib/cmake"
+            mkdir -p "profiler"
+            pushd "profiler"
+                cmake "$top/$source_dir/profiler" -G Ninja ${MACOSX_EXTRA_CMAKE_ARGS} \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
+                cmake --build . --config Release
+
+                cp -a tracy-profiler $stage_dir/bin
+            popd
+
+            mkdir -p "update"
+            pushd "update"
+                cmake "$top/$source_dir/update" -G Ninja ${MACOSX_EXTRA_CMAKE_ARGS} \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
+                cmake --build . --config Release
+
+                cp -a tracy-update $stage_dir/bin
+            popd
+# See common code below that copies haders to packages/include/
+        ;;
+
+        linux*)
+            # force CPM dependencies glfw and freetype to be built statically to make built executables easier to deploy anywhere
+            patch --directory "$top/$source_dir" -p1 < "$top/tracy-deps-static.patch"
+
+            mkdir -p "$stage_dir/bin"
+            mkdir -p "capture"
+            pushd "capture"
+                cmake "$top/$source_dir/capture" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
+                cmake --build . --config Release
+
+                cp -a tracy-capture $stage_dir/bin
+            popd
+
+            mkdir -p "csvexport"
+            pushd "csvexport"
+                cmake "$top/$source_dir/csvexport" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
+                cmake --build . --config Release
+
+                cp -a tracy-csvexport $stage_dir/bin
+            popd
+
+            mkdir -p "profiler"
+            pushd "profiler"
+                cmake "$top/$source_dir/profiler" -G Ninja -DCMAKE_BUILD_TYPE=Release -DLEGACY=ON \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
+                cmake --build . --config Release
+
+                cp -a tracy-profiler $stage_dir/bin
+            popd
+
+            mkdir -p "update"
+            pushd "update"
+                cmake "$top/$source_dir/update" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DDOWNLOAD_CAPSTONE=ON -DDOWNLOAD_GLFW=ON -DDOWNLOAD_FREETYPE=ON
+                cmake --build . --config Release
+
+                cp -a tracy-update $stage_dir/bin
+            popd
+# See common code below that copies haders to packages/include/
         ;;
     esac
+popd
+
+# Common code that copies headers to packages/include/
+pushd "$source_dir"
+	mkdir -p "$stage_dir/include/tracy"
+	cp -a public/* "$stage_dir/include/tracy/"
 popd
 
 # copy license file

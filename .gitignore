@@ -37,3 +37,10 @@ vcpkg/*
 /**/__pycache__/**
 extra/vswhere.exe
 extra/tracy-build
+stage/
+tmp/
+CMakeCache.txt
+tracy/CMakeFiles/
+tracy/Makefile
+tracy/cmake_install.cmake
+tracy/*.a
