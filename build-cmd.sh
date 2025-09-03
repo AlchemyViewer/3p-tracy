@@ -42,8 +42,6 @@ source_dir="tracy"
 # remove_cxxstd apply_patch
 source "$(dirname "$AUTOBUILD_VARIABLES_FILE")/functions"
 
-apply_patch "$top/patches/fix-msvc-build.patch" "$source_dir"
-
 # force CPM dependencies glfw and freetype to be built statically to make built executables easier to deploy anywhere
 apply_patch "$top/patches/tracy-deps-static.patch" "$source_dir"
 
